@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v11-raw-fallback';
+const VERSION = 'youtube-search-v12-history';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -119,6 +119,129 @@ async function youtubeChannelsByIds(ids, apiKey) {
   }
 
   return Array.isArray(data?.items) ? data.items : [];
+}
+
+
+
+async function youtubeHistoryChannelSeeds(ids, apiKey) {
+  const unique = [...new Set(ids)].filter(id => CHANNEL_ID.test(id)).slice(0, 20);
+  if (!unique.length) return [];
+
+  const params = new URLSearchParams({
+    part: 'snippet,contentDetails',
+    id: unique.join(','),
+    maxResults: String(unique.length),
+    key: apiKey
+  });
+  const res = await fetch('https://www.googleapis.com/youtube/v3/channels?' + params.toString(), {
+    headers: { 'Accept': 'application/json' }
+  });
+  const text = await res.text();
+  if (!res.ok) throw new YouTubeError(res.status, text.slice(0, 1200));
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { throw new Error('YouTube returned invalid JSON'); }
+
+  return (Array.isArray(data?.items) ? data.items : []).map(item => {
+    const sn = item?.snippet || {};
+    const thumbs = sn.thumbnails || {};
+    return {
+      id: item?.id || '',
+      name: sn.title || item?.id || '',
+      photo: thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url || '',
+      uploads: item?.contentDetails?.relatedPlaylists?.uploads || ''
+    };
+  }).filter(x => CHANNEL_ID.test(x.id) && x.uploads);
+}
+
+async function youtubePlaylistItems(playlistId, apiKey, pageToken = '') {
+  const params = new URLSearchParams({
+    part: 'contentDetails',
+    playlistId,
+    maxResults: '50',
+    key: apiKey
+  });
+  if (pageToken) params.set('pageToken', pageToken);
+  const res = await fetch('https://www.googleapis.com/youtube/v3/playlistItems?' + params.toString(), {
+    headers: { 'Accept': 'application/json' }
+  });
+  const text = await res.text();
+  if (!res.ok) throw new YouTubeError(res.status, text.slice(0, 1200));
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { throw new Error('YouTube returned invalid JSON'); }
+  return {
+    ids: (Array.isArray(data?.items) ? data.items : []).map(x => x?.contentDetails?.videoId || '').filter(Boolean),
+    nextPageToken: data?.nextPageToken || ''
+  };
+}
+
+async function youtubeVideoDetails(ids, apiKey) {
+  const unique = [...new Set(ids)].filter(Boolean).slice(0, 50);
+  if (!unique.length) return [];
+  const params = new URLSearchParams({
+    part: 'snippet,liveStreamingDetails,contentDetails',
+    id: unique.join(','),
+    maxResults: String(unique.length),
+    key: apiKey
+  });
+  const res = await fetch('https://www.googleapis.com/youtube/v3/videos?' + params.toString(), {
+    headers: { 'Accept': 'application/json' }
+  });
+  const text = await res.text();
+  if (!res.ok) throw new YouTubeError(res.status, text.slice(0, 1200));
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { throw new Error('YouTube returned invalid JSON'); }
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+function historyVideoRow(item, channel) {
+  const id = item?.id || '';
+  const sn = item?.snippet || {};
+  const live = item?.liveStreamingDetails || {};
+  if (!id || !live.actualStartTime || !live.actualEndTime) return null;
+  return {
+    id,
+    title: sn.title || '(タイトルなし)',
+    desc: sn.description || '',
+    description: sn.description || '',
+    status: 'past',
+    type: 'stream',
+    start_actual: live.actualStartTime,
+    end_actual: live.actualEndTime,
+    published_at: sn.publishedAt || live.actualStartTime,
+    channel_id: channel.id,
+    channel: {
+      id: channel.id,
+      name: channel.name || sn.channelTitle || channel.id,
+      photo: channel.photo || '',
+      thumbnail: channel.photo || '',
+      type: 'vtuber'
+    }
+  };
+}
+
+async function youtubeHistoryForChannel(channel, apiKey) {
+  const out = new Map();
+  let pageToken = '';
+  // Shorts/通常動画が多いチャンネルでも10配信を拾いやすいよう最大100投稿を見る。
+  for (let page = 0; page < 2 && out.size < 10; page++) {
+    const list = await youtubePlaylistItems(channel.uploads, apiKey, pageToken);
+    const details = await youtubeVideoDetails(list.ids, apiKey);
+    for (const item of details) {
+      const row = historyVideoRow(item, channel);
+      if (row) out.set(row.id, row);
+    }
+    pageToken = list.nextPageToken;
+    if (!pageToken) break;
+  }
+  return [...out.values()]
+    .sort((a, b) => new Date(b.start_actual || b.published_at || 0) - new Date(a.start_actual || a.published_at || 0))
+    .slice(0, 10);
+}
+
+async function youtubeHistory(ids, apiKey) {
+  const channels = await youtubeHistoryChannelSeeds(ids, apiKey);
+  const groups = await mapLimited(channels, 3, c => youtubeHistoryForChannel(c, apiKey));
+  return groups.flat();
 }
 
 function youtubeChannelFromDetail(item) {
@@ -697,6 +820,47 @@ async function handleHolodex(request, env, ctx) {
       return response;
     } catch (err) {
       console.error('YouTube search failed', err);
+      return json({
+        error: youtubeErrorMessage(err),
+        workerVersion: VERSION,
+        upstreamStatus: err instanceof YouTubeError ? err.status : null
+      }, 502);
+    }
+  }
+
+
+
+  if (action === 'history') {
+    const ids = [...new Set(
+      (url.searchParams.get('ids') || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(id => CHANNEL_ID.test(id))
+    )].slice(0, 20);
+
+    if (!ids.length) return json([], 200, 300);
+    if (!env.YOUTUBE_API_KEY) {
+      return json({
+        error: 'サーバーのYouTube APIキーが未設定です。',
+        workerVersion: VERSION
+      }, 503);
+    }
+
+    const cache = caches.default;
+    const cacheUrl = new URL(url.toString());
+    cacheUrl.searchParams.set('_worker', VERSION);
+    cacheUrl.searchParams.set('_source', 'youtube-history');
+    const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
+    const hit = await cache.match(cacheKey);
+    if (hit) return hit;
+
+    try {
+      const payload = await youtubeHistory(ids, env.YOUTUBE_API_KEY);
+      const response = json(payload, 200, 600);
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      return response;
+    } catch (err) {
+      console.error('YouTube history failed', err);
       return json({
         error: youtubeErrorMessage(err),
         workerVersion: VERSION,

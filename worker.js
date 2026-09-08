@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'search-fix-v7-generic';
+const VERSION = 'youtube-search-v8';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -49,6 +49,124 @@ async function holodex(path, apiKey, options = {}) {
   } catch {
     throw new Error(`Holodex returned invalid JSON: ${path}`);
   }
+}
+
+class YouTubeError extends Error {
+  constructor(status, body = '') {
+    super(`YouTube ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function hasJapanese(text = '') {
+  return /[\u3040-\u30ff\u3400-\u9fff]/.test(String(text));
+}
+
+async function youtubeSearchChannels(q, apiKey) {
+  const params = new URLSearchParams({
+    part: 'snippet',
+    type: 'channel',
+    maxResults: '10',
+    q,
+    key: apiKey
+  });
+
+  // 日本語入力のときだけ日本語結果を少し優先。絞り込みではないので海外VTuberも検索できる。
+  if (hasJapanese(q)) params.set('relevanceLanguage', 'ja');
+
+  const res = await fetch('https://www.googleapis.com/youtube/v3/search?' + params.toString(), {
+    headers: { 'Accept': 'application/json' }
+  });
+  const text = await res.text();
+
+  if (!res.ok) throw new YouTubeError(res.status, text.slice(0, 1200));
+
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error('YouTube returned invalid JSON');
+  }
+
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+function youtubeItemToChannel(item, rank) {
+  const id = item?.id?.channelId || '';
+  if (!CHANNEL_ID.test(id)) return null;
+  const sn = item?.snippet || {};
+  const thumbs = sn.thumbnails || {};
+  const photo = thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url || '';
+
+  return {
+    id,
+    name: sn.channelTitle || sn.title || id,
+    english_name: '',
+    photo,
+    thumbnail: photo,
+    org: '',
+    type: 'vtuber',
+    lang: '',
+    description: sn.description || '',
+    source: 'youtube',
+    holodex_verified: false,
+    _rank: rank
+  };
+}
+
+async function searchYouTubeChannels(q, youtubeKey, holodexKey) {
+  const rows = await youtubeSearchChannels(q, youtubeKey);
+  const base = rows
+    .map((item, i) => youtubeItemToChannel(item, i))
+    .filter(Boolean);
+
+  if (!base.length) return [];
+
+  // Holodexに登録済みなら所属・英語名を補う。ただし検索順位とYouTubeの名前/画像は変えない。
+  // Holodex未登録でも検索候補からは落とさない。
+  let verified = [];
+  if (holodexKey) {
+    verified = await mapLimited(base, 4, async c => {
+      const h = await getChannel(c.id, holodexKey);
+      return { youtube: c, holodex: h };
+    });
+  } else {
+    verified = base.map(c => ({ youtube: c, holodex: null }));
+  }
+
+  return verified
+    .filter(x => x?.youtube)
+    .sort((a, b) => a.youtube._rank - b.youtube._rank)
+    .map(({ youtube: y, holodex: h }) => ({
+      id: y.id,
+      name: y.name,
+      english_name: h?.english_name || '',
+      photo: y.photo,
+      thumbnail: y.thumbnail,
+      org: h?.org || '',
+      type: 'vtuber',
+      lang: h?.lang || '',
+      description: y.description,
+      source: 'youtube',
+      holodex_verified: !!h
+    }))
+    .slice(0, 10);
+}
+
+function youtubeErrorMessage(err) {
+  if (!(err instanceof YouTubeError)) {
+    return 'YouTube検索に接続できませんでした。少ししてから再試行してください。';
+  }
+
+  const body = String(err.body || '');
+  if (/quotaExceeded|dailyLimitExceeded|rateLimitExceeded/i.test(body)) {
+    return 'YouTube検索の本日の無料検索上限に達しました。時間を置いて再試行してください。';
+  }
+  if (err.status === 400 || err.status === 401 || err.status === 403) {
+    return 'YouTube APIキーが利用できません。CloudflareのYOUTUBE_API_KEYを確認してください。';
+  }
+  return 'YouTube検索に接続できませんでした。少ししてから再試行してください。';
 }
 
 function minimalChannel(c) {
@@ -350,6 +468,70 @@ async function enrichLiveRows(rows, apiKey) {
 }
 
 async function handleHolodex(request, env, ctx) {
+  const url = new URL(request.url);
+  const action = url.searchParams.get('action') || '';
+
+  // 推し追加の名前検索はYouTube公式APIを使う。
+  if (action === 'search') {
+    const q = (url.searchParams.get('q') || '').trim().slice(0, 60);
+    if (!q) {
+      return json({ error: '検索語が空です。', workerVersion: VERSION }, 400);
+    }
+    if (!env.YOUTUBE_API_KEY) {
+      return json({
+        error: 'サーバーのYouTube APIキーが未設定です。',
+        workerVersion: VERSION
+      }, 503);
+    }
+
+    const cache = caches.default;
+    const cacheUrl = new URL(url.toString());
+    cacheUrl.searchParams.set('_worker', VERSION);
+    cacheUrl.searchParams.set('_source', 'youtube');
+    const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
+    const hit = await cache.match(cacheKey);
+    if (hit) return hit;
+
+    try {
+      const payload = await searchYouTubeChannels(q, env.YOUTUBE_API_KEY, env.HOLODEX_API_KEY || '');
+      // 人名・チャンネル名は頻繁には変わらないので24時間キャッシュして無料検索枠を節約。
+      const response = json(payload, 200, 86400);
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      return response;
+    } catch (err) {
+      console.error('YouTube search failed', err);
+      return json({
+        error: youtubeErrorMessage(err),
+        workerVersion: VERSION,
+        upstreamStatus: err instanceof YouTubeError ? err.status : null
+      }, 502);
+    }
+  }
+
+  if (action === 'health') {
+    let holodexUpstreamOk = false;
+    let holodexUpstreamStatus = null;
+
+    if (env.HOLODEX_API_KEY) {
+      try {
+        await holodex('/channels/UC5CwaMl1eIgY8h02uZw7u8A', env.HOLODEX_API_KEY);
+        holodexUpstreamOk = true;
+      } catch (err) {
+        holodexUpstreamStatus = err?.status || null;
+      }
+    }
+
+    return json({
+      ok: true,
+      workerVersion: VERSION,
+      youtubeKeyConfigured: !!env.YOUTUBE_API_KEY,
+      holodexKeyConfigured: !!env.HOLODEX_API_KEY,
+      holodexUpstreamOk,
+      holodexUpstreamStatus
+    });
+  }
+
+  // LIVE・チャンネルID直接登録はこれまで通りHolodex。
   if (!env.HOLODEX_API_KEY) {
     return json({
       error: 'サーバーのHolodex APIキーが未設定です。',
@@ -357,50 +539,12 @@ async function handleHolodex(request, env, ctx) {
     }, 503);
   }
 
-  const url = new URL(request.url);
-  const action = url.searchParams.get('action') || '';
-
   try {
-    if (action === 'search') {
-      const q = (url.searchParams.get('q') || '').trim().slice(0, 60);
-
-      if (!q) {
-        return json({
-          error: '検索語が空です。',
-          workerVersion: VERSION
-        }, 400);
-      }
-
-      const payload = await searchChannels(q, env.HOLODEX_API_KEY);
-      return json(payload, 200, 0);
-    }
-
-    if (action === 'health') {
-      let upstreamOk = false;
-      let upstreamStatus = null;
-
-      try {
-        await holodex('/channels/UC5CwaMl1eIgY8h02uZw7u8A', env.HOLODEX_API_KEY);
-        upstreamOk = true;
-      } catch (err) {
-        upstreamStatus = err?.status || null;
-      }
-
-      return json({
-        ok: true,
-        workerVersion: VERSION,
-        holodexKeyConfigured: true,
-        upstreamOk,
-        upstreamStatus
-      });
-    }
-
     const cache = caches.default;
     const cacheUrl = new URL(url.toString());
     cacheUrl.searchParams.set('_worker', VERSION);
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
     const hit = await cache.match(cacheKey);
-
     if (hit) return hit;
 
     let payload;
@@ -414,7 +558,6 @@ async function handleHolodex(request, env, ctx) {
       }
 
       const c = await getChannel(id, env.HOLODEX_API_KEY);
-
       if (!c) {
         return json({ error: 'VTuberチャンネルを取得できませんでした。' }, 404);
       }
@@ -443,11 +586,7 @@ async function handleHolodex(request, env, ctx) {
     }
 
     const response = json(payload, 200, ttl);
-
-    if (ttl > 0) {
-      ctx.waitUntil(cache.put(cacheKey, response.clone()));
-    }
-
+    if (ttl > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   } catch (err) {
     console.error('handleHolodex failed', err);

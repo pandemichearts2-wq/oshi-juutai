@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v8';
+const VERSION = 'youtube-search-v9-mixed';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -63,16 +63,17 @@ function hasJapanese(text = '') {
   return /[\u3040-\u30ff\u3400-\u9fff]/.test(String(text));
 }
 
-async function youtubeSearchChannels(q, apiKey) {
+async function youtubeSearchMixed(q, apiKey) {
   const params = new URLSearchParams({
     part: 'snippet',
-    type: 'channel',
-    maxResults: '10',
+    maxResults: '25',
     q,
     key: apiKey
   });
 
-  // 日本語入力のときだけ日本語結果を少し優先。絞り込みではないので海外VTuberも検索できる。
+  // type を channel に固定しない。
+  // YouTube の通常検索と同じように video / channel / playlist をまとめて取り、
+  // 検索にヒットした動画や再生リストの「投稿元チャンネル」も候補として拾う。
   if (hasJapanese(q)) params.set('relevanceLanguage', 'ja');
 
   const res = await fetch('https://www.googleapis.com/youtube/v3/search?' + params.toString(), {
@@ -92,66 +93,147 @@ async function youtubeSearchChannels(q, apiKey) {
   return Array.isArray(data?.items) ? data.items : [];
 }
 
-function youtubeItemToChannel(item, rank) {
-  const id = item?.id?.channelId || '';
+async function youtubeChannelsByIds(ids, apiKey) {
+  const unique = [...new Set(ids)].filter(id => CHANNEL_ID.test(id)).slice(0, 50);
+  if (!unique.length) return [];
+
+  const params = new URLSearchParams({
+    part: 'snippet,statistics',
+    id: unique.join(','),
+    maxResults: String(unique.length),
+    key: apiKey
+  });
+
+  const res = await fetch('https://www.googleapis.com/youtube/v3/channels?' + params.toString(), {
+    headers: { 'Accept': 'application/json' }
+  });
+  const text = await res.text();
+
+  if (!res.ok) throw new YouTubeError(res.status, text.slice(0, 1200));
+
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error('YouTube returned invalid JSON');
+  }
+
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+function youtubeChannelFromDetail(item) {
+  const id = item?.id || '';
   if (!CHANNEL_ID.test(id)) return null;
   const sn = item?.snippet || {};
   const thumbs = sn.thumbnails || {};
   const photo = thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url || '';
+  const subs = Number(item?.statistics?.subscriberCount || 0) || 0;
 
   return {
     id,
-    name: sn.channelTitle || sn.title || id,
+    name: sn.title || id,
     english_name: '',
     photo,
     thumbnail: photo,
     org: '',
     type: 'vtuber',
-    lang: '',
+    lang: sn.defaultLanguage || sn.defaultAudioLanguage || '',
+    subscriber_count: subs,
     description: sn.description || '',
     source: 'youtube',
-    holodex_verified: false,
-    _rank: rank
+    holodex_verified: false
   };
 }
 
+function scoreYoutubeCandidate(c, q, meta = {}) {
+  const needle = normalize(q);
+  const name = normalize(c?.name || '');
+  const desc = normalize(c?.description || '');
+  let score = 0;
+
+  if (name === needle) score += 20000;
+  else if (name.startsWith(needle)) score += 9000;
+  else if (name.includes(needle)) score += 6000;
+  if (desc.includes(needle)) score += 1500;
+
+  // 検索結果に「チャンネルそのもの」が出た場合は強く優先。
+  if (meta.directChannel) score += 10000;
+
+  // 同じ投稿元が何件も検索結果に出るほど、本人チャンネルの可能性を上げる。
+  score += Math.min(Number(meta.hits || 0), 10) * 1800;
+
+  // 上位に出た検索結果ほど少し優先。
+  const firstRank = Number.isFinite(meta.firstRank) ? meta.firstRank : 999;
+  score += Math.max(0, 2500 - firstRank * 80);
+
+  const subs = Number(c?.subscriber_count || 0) || 0;
+  if (subs > 0) score += Math.min(500, Math.log10(subs + 1) * 70);
+  return score;
+}
+
 async function searchYouTubeChannels(q, youtubeKey, holodexKey) {
-  const rows = await youtubeSearchChannels(q, youtubeKey);
-  const base = rows
-    .map((item, i) => youtubeItemToChannel(item, i))
-    .filter(Boolean);
+  const rows = await youtubeSearchMixed(q, youtubeKey);
+  if (!rows.length) return [];
 
-  if (!base.length) return [];
+  const stats = new Map();
 
-  // Holodexに登録済みなら所属・英語名を補う。ただし検索順位とYouTubeの名前/画像は変えない。
-  // Holodex未登録でも検索候補からは落とさない。
-  let verified = [];
-  if (holodexKey) {
-    verified = await mapLimited(base, 4, async c => {
-      const h = await getChannel(c.id, holodexKey);
-      return { youtube: c, holodex: h };
+  rows.forEach((item, rank) => {
+    const kind = item?.id?.kind || '';
+    const snippet = item?.snippet || {};
+
+    // チャンネル検索結果なら id.channelId。
+    // 動画・再生リストなら snippet.channelId = その投稿元チャンネル。
+    const id = kind === 'youtube#channel'
+      ? (item?.id?.channelId || '')
+      : (snippet.channelId || '');
+
+    if (!CHANNEL_ID.test(id)) return;
+
+    const prev = stats.get(id) || {
+      id,
+      hits: 0,
+      directChannel: false,
+      firstRank: rank
+    };
+
+    prev.hits += 1;
+    prev.directChannel = prev.directChannel || kind === 'youtube#channel';
+    prev.firstRank = Math.min(prev.firstRank, rank);
+    stats.set(id, prev);
+  });
+
+  const ids = [...stats.keys()];
+  if (!ids.length) return [];
+
+  const detailRows = await youtubeChannelsByIds(ids, youtubeKey);
+  let candidates = detailRows
+    .map(youtubeChannelFromDetail)
+    .filter(Boolean)
+    .map(c => ({ c, meta: stats.get(c.id) || {} }))
+    .sort((a, b) => scoreYoutubeCandidate(b.c, q, b.meta) - scoreYoutubeCandidate(a.c, q, a.meta))
+    .slice(0, 10);
+
+  // Holodexに登録済みなら所属・英語名だけ補う。
+  // YouTubeの検索順位・名前・画像は維持し、Holodex未登録でも候補から落とさない。
+  if (holodexKey && candidates.length) {
+    const enriched = await mapLimited(candidates, 4, async entry => {
+      const h = await getChannel(entry.c.id, holodexKey);
+      return { ...entry, h };
     });
-  } else {
-    verified = base.map(c => ({ youtube: c, holodex: null }));
+
+    candidates = enriched.map(entry => ({
+      ...entry,
+      c: {
+        ...entry.c,
+        english_name: entry.h?.english_name || '',
+        org: entry.h?.org || '',
+        lang: entry.h?.lang || entry.c.lang || '',
+        holodex_verified: !!entry.h
+      }
+    }));
   }
 
-  return verified
-    .filter(x => x?.youtube)
-    .sort((a, b) => a.youtube._rank - b.youtube._rank)
-    .map(({ youtube: y, holodex: h }) => ({
-      id: y.id,
-      name: y.name,
-      english_name: h?.english_name || '',
-      photo: y.photo,
-      thumbnail: y.thumbnail,
-      org: h?.org || '',
-      type: 'vtuber',
-      lang: h?.lang || '',
-      description: y.description,
-      source: 'youtube',
-      holodex_verified: !!h
-    }))
-    .slice(0, 10);
+  return candidates.map(x => x.c).slice(0, 10);
 }
 
 function youtubeErrorMessage(err) {
@@ -494,8 +576,8 @@ async function handleHolodex(request, env, ctx) {
 
     try {
       const payload = await searchYouTubeChannels(q, env.YOUTUBE_API_KEY, env.HOLODEX_API_KEY || '');
-      // 人名・チャンネル名は頻繁には変わらないので24時間キャッシュして無料検索枠を節約。
-      const response = json(payload, 200, 86400);
+      // 検索候補は6時間キャッシュして無料検索枠を節約。
+      const response = json(payload, 200, 21600);
       ctx.waitUntil(cache.put(cacheKey, response.clone()));
       return response;
     } catch (err) {

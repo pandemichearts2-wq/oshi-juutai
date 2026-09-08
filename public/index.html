@@ -186,3 +186,24 @@ $$('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$$('.navbtn[data-nav]
 </script>
 </body>
 </html>
+/* 推し追加モーダル：画面からはみ出さない */
+#addModal .modal{
+  max-height:calc(100dvh - 36px);
+  overflow-y:auto;
+  overscroll-behavior:contain;
+}
+
+/* 検索候補が多くても下を圧迫しすぎない */
+#addModal .search-results{
+  max-height:min(300px,38vh);
+}
+
+/* 「閉じる」「この推しを追加」を常に押せる位置に */
+#addModal .modal-actions{
+  position:sticky;
+  bottom:0;
+  z-index:5;
+  background:#fff;
+  padding-top:12px;
+  padding-bottom:2px;
+}

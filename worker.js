@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v10-debug';
+const VERSION = 'youtube-search-v11-raw-fallback';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -181,40 +181,87 @@ async function searchYouTubeChannels(q, youtubeKey, holodexKey) {
     const kind = item?.id?.kind || '';
     const snippet = item?.snippet || {};
 
-    // チャンネル検索結果なら id.channelId。
-    // 動画・再生リストなら snippet.channelId = その投稿元チャンネル。
+    // チャンネルそのものなら id.channelId。
+    // 動画 / 再生リストなら snippet.channelId = 投稿元チャンネル。
     const id = kind === 'youtube#channel'
       ? (item?.id?.channelId || '')
       : (snippet.channelId || '');
 
     if (!CHANNEL_ID.test(id)) return;
 
+    const thumbs = snippet.thumbnails || {};
+    const directPhoto = kind === 'youtube#channel'
+      ? (thumbs.high?.url || thumbs.medium?.url || thumbs.default?.url || '')
+      : '';
+
     const prev = stats.get(id) || {
       id,
       hits: 0,
       directChannel: false,
-      firstRank: rank
+      firstRank: rank,
+      fallbackName: snippet.channelTitle || snippet.title || id,
+      fallbackPhoto: ''
     };
 
     prev.hits += 1;
     prev.directChannel = prev.directChannel || kind === 'youtube#channel';
     prev.firstRank = Math.min(prev.firstRank, rank);
+
+    // 直接チャンネル結果がある場合は、そのチャンネル名とアイコンを必ず保持する。
+    // channels.list 側の取得に失敗しても、検索候補を消さないためのフォールバック。
+    if (kind === 'youtube#channel') {
+      prev.fallbackName = snippet.title || snippet.channelTitle || prev.fallbackName || id;
+      if (directPhoto) prev.fallbackPhoto = directPhoto;
+    } else if (!prev.fallbackName) {
+      prev.fallbackName = snippet.channelTitle || id;
+    }
+
     stats.set(id, prev);
   });
 
   const ids = [...stats.keys()];
   if (!ids.length) return [];
 
-  const detailRows = await youtubeChannelsByIds(ids, youtubeKey);
-  let candidates = detailRows
-    .map(youtubeChannelFromDetail)
-    .filter(Boolean)
-    .map(c => ({ c, meta: stats.get(c.id) || {} }))
+  // 詳細取得は補助扱い。ここが0件 / 失敗でも検索結果そのものから候補を返す。
+  let detailRows = [];
+  try {
+    detailRows = await youtubeChannelsByIds(ids, youtubeKey);
+  } catch (err) {
+    console.warn('YouTube channels.list failed; using search fallback', err?.status || '', err?.message || err);
+  }
+
+  const detailMap = new Map(
+    detailRows
+      .map(youtubeChannelFromDetail)
+      .filter(Boolean)
+      .map(c => [c.id, c])
+  );
+
+  let candidates = ids
+    .map(id => {
+      const meta = stats.get(id) || {};
+      const detailed = detailMap.get(id);
+      const fallbackPhoto = meta.fallbackPhoto || '';
+      const c = detailed || {
+        id,
+        name: meta.fallbackName || id,
+        english_name: '',
+        photo: fallbackPhoto,
+        thumbnail: fallbackPhoto,
+        org: '',
+        type: 'vtuber',
+        lang: '',
+        subscriber_count: 0,
+        description: '',
+        source: 'youtube-search-fallback',
+        holodex_verified: false
+      };
+      return { c, meta };
+    })
     .sort((a, b) => scoreYoutubeCandidate(b.c, q, b.meta) - scoreYoutubeCandidate(a.c, q, a.meta))
     .slice(0, 10);
 
-  // Holodexに登録済みなら所属・英語名だけ補う。
-  // YouTubeの検索順位・名前・画像は維持し、Holodex未登録でも候補から落とさない。
+  // Holodex は所属・英語名の補完だけ。未登録・取得失敗でも候補は絶対に落とさない。
   if (holodexKey && candidates.length) {
     const enriched = await mapLimited(candidates, 4, async entry => {
       const h = await getChannel(entry.c.id, holodexKey);
@@ -225,8 +272,8 @@ async function searchYouTubeChannels(q, youtubeKey, holodexKey) {
       ...entry,
       c: {
         ...entry.c,
-        english_name: entry.h?.english_name || '',
-        org: entry.h?.org || '',
+        english_name: entry.h?.english_name || entry.c.english_name || '',
+        org: entry.h?.org || entry.c.org || '',
         lang: entry.h?.lang || entry.c.lang || '',
         holodex_verified: !!entry.h
       }
@@ -235,7 +282,6 @@ async function searchYouTubeChannels(q, youtubeKey, holodexKey) {
 
   return candidates.map(x => x.c).slice(0, 10);
 }
-
 
 async function debugYouTubeSearch(q, apiKey) {
   const params = new URLSearchParams({

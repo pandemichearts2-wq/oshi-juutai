@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v9-mixed';
+const VERSION = 'youtube-search-v10-debug';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -234,6 +234,54 @@ async function searchYouTubeChannels(q, youtubeKey, holodexKey) {
   }
 
   return candidates.map(x => x.c).slice(0, 10);
+}
+
+
+async function debugYouTubeSearch(q, apiKey) {
+  const params = new URLSearchParams({
+    part: 'snippet',
+    maxResults: '10',
+    q,
+    key: apiKey
+  });
+  if (hasJapanese(q)) params.set('relevanceLanguage', 'ja');
+
+  const debugUrl = new URL('https://www.googleapis.com/youtube/v3/search?' + params.toString());
+  const safeUrl = new URL(debugUrl.toString());
+  safeUrl.searchParams.set('key', '***hidden***');
+
+  const res = await fetch(debugUrl.toString(), { headers: { 'Accept': 'application/json' } });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch {}
+
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return {
+    workerVersion: VERSION,
+    q,
+    requestUrl: safeUrl.toString(),
+    status: res.status,
+    ok: res.ok,
+    regionCode: data?.regionCode || null,
+    pageInfo: data?.pageInfo || null,
+    itemCount: items.length,
+    items: items.slice(0, 10).map((item, rank) => ({
+      rank,
+      kind: item?.id?.kind || null,
+      videoId: item?.id?.videoId || null,
+      channelIdFromId: item?.id?.channelId || null,
+      playlistId: item?.id?.playlistId || null,
+      channelIdFromSnippet: item?.snippet?.channelId || null,
+      title: item?.snippet?.title || null,
+      channelTitle: item?.snippet?.channelTitle || null
+    })),
+    error: data?.error ? {
+      code: data.error.code || null,
+      message: data.error.message || null,
+      reasons: Array.isArray(data.error.errors) ? data.error.errors.map(e => e?.reason || null) : []
+    } : null,
+    rawPrefix: !res.ok && !data ? text.slice(0, 500) : null
+  };
 }
 
 function youtubeErrorMessage(err) {
@@ -552,6 +600,27 @@ async function enrichLiveRows(rows, apiKey) {
 async function handleHolodex(request, env, ctx) {
   const url = new URL(request.url);
   const action = url.searchParams.get('action') || '';
+
+
+  if (action === 'debugyoutube') {
+    const q = (url.searchParams.get('q') || '').trim().slice(0, 60);
+    if (!q) return json({ error: '検索語が空です。', workerVersion: VERSION }, 400);
+    if (!env.YOUTUBE_API_KEY) {
+      return json({ error: 'サーバーのYouTube APIキーが未設定です。', workerVersion: VERSION }, 503);
+    }
+    try {
+      const result = await debugYouTubeSearch(q, env.YOUTUBE_API_KEY);
+      return json(result, 200, 0);
+    } catch (err) {
+      return json({
+        workerVersion: VERSION,
+        q,
+        debugFailed: true,
+        name: err?.name || null,
+        message: err?.message || String(err)
+      }, 500, 0);
+    }
+  }
 
   // 推し追加の名前検索はYouTube公式APIを使う。
   if (action === 'search') {

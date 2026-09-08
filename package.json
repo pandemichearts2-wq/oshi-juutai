@@ -1,0 +1,11 @@
+{
+  "name": "oshi-juutai-public-beta",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev public"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,6 +1,7 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'search-fix-v5-jp-alias';
+const VERSION = 'search-fix-v7-generic';
+
 
 function json(data, status = 200, ttl = 0) {
   const headers = {
@@ -60,37 +61,62 @@ function minimalChannel(c) {
     thumbnail: c.thumbnail || c.photo || '',
     org: c.org || '',
     type: c.type || 'vtuber',
-    lang: c.lang || ''
+    lang: c.lang || '',
+    subscriber_count: Number(c.subscriber_count || 0) || 0,
+    description: c.description || '',
+    twitter: c.twitter || ''
   };
 }
 
+function kanaFold(s = '') {
+  return String(s).replace(/[ァ-ヶ]/g, ch =>
+    String.fromCharCode(ch.charCodeAt(0) - 0x60)
+  );
+}
+
 function normalize(s = '') {
-  return String(s)
+  return kanaFold(String(s)
     .normalize('NFKC')
-    .toLowerCase()
+    .toLowerCase())
     .replace(/[\s　._・･ー\-]/g, '');
 }
 
-function channelScore(c, q) {
+function searchableChannelText(c) {
+  return normalize([
+    c?.name || '',
+    c?.english_name || '',
+    c?.twitter || '',
+    c?.description || ''
+  ].join(' '));
+}
+
+function channelScore(c, q, extraHits = 0) {
   const needle = normalize(q);
   const name = normalize(c?.name || '');
   const en = normalize(c?.english_name || '');
+  const twitter = normalize(c?.twitter || '');
+  const desc = normalize(c?.description || '');
   let score = 0;
 
-  if (name === needle || en === needle) score += 10000;
-  if (name.startsWith(needle) || en.startsWith(needle)) score += 3000;
-  if (name.includes(needle) || en.includes(needle)) score += 1500;
+  if (name === needle || en === needle || twitter === needle) score += 20000;
+  if (name.startsWith(needle) || en.startsWith(needle) || twitter.startsWith(needle)) score += 6000;
+  if (name.includes(needle) || en.includes(needle) || twitter.includes(needle)) score += 3500;
+  if (desc.includes(needle)) score += 1800;
   if (c?.type === 'vtuber') score += 100;
-  if (c?.org) score += 10;
+  if (c?.org) score += 20;
+
+  // 同じ検索語で複数本ヒットするチャンネルほど本人である可能性が高い。
+  score += Math.min(Number(extraHits || 0), 20) * 700;
+
+  // 同点時だけ大手公式チャンネルを少し優先する程度の弱い補正。
+  const subs = Number(c?.subscriber_count || 0) || 0;
+  if (subs > 0) score += Math.min(300, Math.log10(subs + 1) * 45);
   return score;
 }
 
 function isMatchingChannel(c, q) {
   const needle = normalize(q);
-  if (!needle) return false;
-  const name = normalize(c?.name || '');
-  const en = normalize(c?.english_name || '');
-  return name.includes(needle) || en.includes(needle);
+  return !!needle && searchableChannelText(c).includes(needle);
 }
 
 async function getChannel(id, apiKey) {
@@ -122,6 +148,8 @@ async function mapLimited(items, limit, fn) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return out;
 }
+
+
 
 async function searchAutocomplete(q, apiKey) {
   try {
@@ -175,12 +203,14 @@ async function searchAutocomplete(q, apiKey) {
 
 async function searchVideoIndex(q, apiKey) {
   try {
+    // Holodex の videoSearch の conditions は「文字列配列」。
+    // v4-v6 では [{ text: q }] にしていたため、日本語名検索が正しく効いていなかった。
     const raw = await holodex('/search/videoSearch', apiKey, {
       method: 'POST',
       body: {
         sort: 'newest',
         target: ['stream'],
-        conditions: [{ text: q }],
+        conditions: [q],
         comment: [],
         offset: 0,
         limit: 50,
@@ -194,41 +224,48 @@ async function searchVideoIndex(q, apiKey) {
 
     for (const v of rows) {
       const c = v?.channel;
-      if (!c) continue;
-      if (!CHANNEL_ID.test(c.id || '')) continue;
+      if (!c || !CHANNEL_ID.test(c.id || '')) continue;
       if (c.type && c.type !== 'vtuber') continue;
 
       const min = minimalChannel(c);
-      const title = normalize(v?.title || v?.name || '');
-      const channelMatch = isMatchingChannel(min, q);
-      const titleMatch = !!needle && title.includes(needle);
+      const haystack = normalize([
+        v?.title || '',
+        v?.description || '',
+        c?.name || '',
+        c?.english_name || ''
+      ].join(' '));
+      const textHit = !!needle && haystack.includes(needle);
+      if (!textHit) continue;
 
-      // Holodexでは日本語のタレント名とYouTubeチャンネル名が一致しない場合がある。
-      // 例: 「星街すいせい」で検索しても、チャンネル名が
-      // "Hoshimachi Suisei" / "Suisei Channel" 系だと名前一致だけでは落ちる。
-      // そのため、動画タイトルに検索語が含まれる本人チャンネルも候補に残す。
-      if (!channelMatch && !titleMatch) continue;
-
-      const prev = stats.get(min.id) || { channel: min, titleHits: 0, channelMatch: false };
-      prev.titleHits += titleMatch ? 1 : 0;
-      prev.channelMatch = prev.channelMatch || channelMatch;
+      const prev = stats.get(min.id) || {
+        channel: min,
+        hits: 0
+      };
+      prev.hits += 1;
       stats.set(min.id, prev);
     }
 
     const ranked = [...stats.values()]
       .sort((a, b) => {
-        const aScore = channelScore(a.channel, q) + a.titleHits * 1200 + (a.channelMatch ? 3000 : 0);
-        const bScore = channelScore(b.channel, q) + b.titleHits * 1200 + (b.channelMatch ? 3000 : 0);
-        return bScore - aScore;
+        const as = channelScore(a.channel, q, a.hits);
+        const bs = channelScore(b.channel, q, b.hits);
+        return bs - as;
       })
-      .slice(0, 10);
+      .slice(0, 12);
 
-    const full = await mapLimited(ranked, 3, async item => {
+    const full = await mapLimited(ranked, 4, async item => {
       const c = await getChannel(item.channel.id, apiKey);
-      return c || item.channel;
+      return {
+        channel: c || item.channel,
+        hits: item.hits
+      };
     });
 
-    return full.filter(Boolean);
+    return full
+      .filter(x => x?.channel)
+      .sort((a, b) => channelScore(b.channel, q, b.hits) - channelScore(a.channel, q, a.hits))
+      .map(x => x.channel)
+      .slice(0, 10);
   } catch (err) {
     console.warn('videoSearch failed', err?.status || '', err?.message || err);
     return [];
@@ -238,7 +275,9 @@ async function searchVideoIndex(q, apiKey) {
 async function searchCatalog(q, apiKey) {
   const map = new Map();
 
-  for (let offset = 0; offset < 400; offset += 50) {
+  // 名前だけでなく説明欄・Twitterも見る。日本語名がチャンネル名に入っていないケースを救う。
+  // API負荷を抑えるため、人気順の先頭1000チャンネルまでをフォールバック検索する。
+  for (let offset = 0; offset < 1000; offset += 50) {
     let page = [];
 
     try {
@@ -254,8 +293,7 @@ async function searchCatalog(q, apiKey) {
     if (!Array.isArray(page) || !page.length) break;
 
     for (const c of page) {
-      if (!c) continue;
-      if (!CHANNEL_ID.test(c.id || '')) continue;
+      if (!c || !CHANNEL_ID.test(c.id || '')) continue;
       if (c.type && c.type !== 'vtuber') continue;
       if (isMatchingChannel(c, q)) map.set(c.id, minimalChannel(c));
     }
@@ -276,11 +314,12 @@ async function searchChannels(q, apiKey) {
 
   const merged = new Map();
   for (const c of [...autocomplete, ...byVideo]) {
-    if (c?.id) merged.set(c.id, c);
+    if (c?.id && !merged.has(c.id)) merged.set(c.id, c);
   }
 
-  // 候補が少ないときだけチャンネル一覧も補助検索する。
-  if (merged.size < 3) {
+  // 通常検索で足りない時だけ、Holodexのチャンネル情報全体を補助検索する。
+  // 個人名の固定辞書は使わない。
+  if (merged.size < 5) {
     const catalog = await searchCatalog(q, apiKey);
     for (const c of catalog) {
       if (c?.id && !merged.has(c.id)) merged.set(c.id, c);

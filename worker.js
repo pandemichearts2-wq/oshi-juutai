@@ -1,5 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
+const VERSION = 'search-fix-v4';
 
 function json(data, status = 200, ttl = 0) {
   const headers = {
@@ -11,30 +12,45 @@ function json(data, status = 200, ttl = 0) {
   return new Response(JSON.stringify(data), { status, headers });
 }
 
-async function holodexGet(path, apiKey) {
-  const res = await fetch(BASE + path, {
-    headers: {
-      'X-APIKEY': apiKey,
-      'Accept': 'application/json'
-    }
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Holodex GET ${res.status}: ${path} ${text.slice(0, 160)}`);
+class HolodexError extends Error {
+  constructor(status, path, body = '') {
+    super(`Holodex ${status}: ${path}`);
+    this.status = status;
+    this.path = path;
+    this.body = body;
   }
-  return res.json();
+}
+
+async function holodex(path, apiKey, options = {}) {
+  const method = options.method || 'GET';
+  const headers = {
+    'X-APIKEY': apiKey,
+    'Accept': 'application/json'
+  };
+  const init = { method, headers };
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(options.body);
+  }
+
+  const res = await fetch(BASE + path, init);
+  const text = await res.text();
+  if (!res.ok) throw new HolodexError(res.status, path, text.slice(0, 240));
+  if (!text) return null;
+  try { return JSON.parse(text); }
+  catch { throw new Error(`Holodex returned invalid JSON: ${path}`); }
 }
 
 function minimalChannel(c) {
   if (!c) return null;
   return {
-    id: c.id || '',
-    name: c.name || '',
+    id: c.id || c.channel_id || '',
+    name: c.name || c.text || '',
     english_name: c.english_name || '',
     photo: c.photo || c.thumbnail || '',
     thumbnail: c.thumbnail || c.photo || '',
     org: c.org || '',
-    type: c.type || '',
+    type: c.type || 'vtuber',
     lang: c.lang || ''
   };
 }
@@ -60,65 +76,134 @@ function channelScore(c, q) {
 }
 
 function isMatchingChannel(c, q) {
-  const n = normalize(q);
-  if (!n) return false;
-  return normalize(c?.name || '').includes(n) || normalize(c?.english_name || '').includes(n);
+  const needle = normalize(q);
+  if (!needle) return false;
+  const name = normalize(c?.name || '');
+  const en = normalize(c?.english_name || '');
+  return name.includes(needle) || en.includes(needle);
 }
 
 async function getChannel(id, apiKey) {
   if (!CHANNEL_ID.test(id || '')) return null;
   try {
-    const c = await holodexGet('/channels/' + encodeURIComponent(id), apiKey);
+    const c = await holodex('/channels/' + encodeURIComponent(id), apiKey);
     if (!c || (c.type && c.type !== 'vtuber')) return null;
     return minimalChannel(c);
-  } catch {
+  } catch (err) {
+    console.warn('getChannel failed', id, err?.status || '', err?.message || err);
     return null;
   }
 }
 
+// Cloudflareの同時外部接続数を圧迫しないよう、少数ずつ処理する。
+async function mapLimited(items, limit, fn) {
+  const out = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 async function searchAutocomplete(q, apiKey) {
   try {
-    // Holodex の実際のAutocompleteは配列 [{type,value,text}, ...] を返す。
-    const raw = await holodexGet('/search/autocomplete?q=' + encodeURIComponent(q), apiKey);
+    const raw = await holodex('/search/autocomplete?q=' + encodeURIComponent(q), apiKey);
     const rows = Array.isArray(raw) ? raw : [];
 
-    const ids = [...new Set(rows.map(row => {
-      if (typeof row === 'string') return CHANNEL_ID.test(row) ? row : '';
-      const candidates = [row?.value, row?.id, row?.channel_id];
-      return candidates.find(v => typeof v === 'string' && CHANNEL_ID.test(v)) || '';
-    }).filter(Boolean))].slice(0, 12);
+    const provisional = [];
+    const ids = [];
+    for (const row of rows) {
+      if (typeof row === 'string') {
+        if (CHANNEL_ID.test(row)) ids.push(row);
+        continue;
+      }
+      if (!row || typeof row !== 'object') continue;
+      const id = [row.value, row.id, row.channel_id].find(v => typeof v === 'string' && CHANNEL_ID.test(v));
+      if (!id) continue;
+      ids.push(id);
+      provisional.push(minimalChannel({
+        id,
+        name: row.text || row.name || '',
+        english_name: row.english_name || '',
+        type: row.type === 'channel' ? 'vtuber' : (row.type || 'vtuber')
+      }));
+    }
 
-    if (!ids.length) return [];
+    const uniqueIds = [...new Set(ids)].slice(0, 10);
+    if (!uniqueIds.length) return [];
 
-    const channels = (await Promise.all(ids.map(id => getChannel(id, apiKey)))).filter(Boolean);
-    return channels
+    const fetched = (await mapLimited(uniqueIds, 3, id => getChannel(id, apiKey))).filter(Boolean);
+    const map = new Map(fetched.map(c => [c.id, c]));
+    for (const p of provisional) {
+      if (p?.id && !map.has(p.id)) map.set(p.id, p);
+    }
+
+    return [...map.values()]
+      .filter(c => c?.id)
       .sort((a, b) => channelScore(b, q) - channelScore(a, q))
       .slice(0, 10);
   } catch (err) {
-    console.warn('autocomplete failed', err);
+    console.warn('autocomplete failed', err?.status || '', err?.message || err);
+    return [];
+  }
+}
+
+async function searchVideoIndex(q, apiKey) {
+  try {
+    const raw = await holodex('/search/videoSearch', apiKey, {
+      method: 'POST',
+      body: {
+        sort: 'newest',
+        target: ['stream'],
+        conditions: [{ text: q }],
+        comment: [],
+        offset: 0,
+        limit: 30,
+        paginated: false
+      }
+    });
+    const rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.items) ? raw.items : []);
+    const map = new Map();
+    for (const v of rows) {
+      const c = v?.channel;
+      if (!c || !CHANNEL_ID.test(c.id || '') || (c.type && c.type !== 'vtuber')) continue;
+      const min = minimalChannel(c);
+      if (isMatchingChannel(min, q)) map.set(min.id, min);
+    }
+    return [...map.values()]
+      .sort((a, b) => channelScore(b, q) - channelScore(a, q))
+      .slice(0, 10);
+  } catch (err) {
+    console.warn('videoSearch failed', err?.status || '', err?.message || err);
     return [];
   }
 }
 
 async function searchCatalog(q, apiKey) {
-  // Autocompleteが一時的に空になる場合の保険。
-  // 人気順のVTuberを最大500件だけ調べるので、主要VTuberはここでも拾える。
-  const offsets = Array.from({ length: 10 }, (_, i) => i * 50);
-  const pages = await Promise.all(offsets.map(async offset => {
+  // 人気順上位を順番に見る。並列にしないのでWorkerの接続上限を踏みにくい。
+  const map = new Map();
+  for (let offset = 0; offset < 400; offset += 50) {
+    let page = [];
     try {
-      return await holodexGet(
+      page = await holodex(
         `/channels?type=vtuber&limit=50&offset=${offset}&sort=subscriber_count&order=desc`,
         apiKey
       );
-    } catch {
-      return [];
+    } catch (err) {
+      console.warn('catalog page failed', offset, err?.status || '', err?.message || err);
+      break;
     }
-  }));
-
-  const map = new Map();
-  for (const c of pages.flat()) {
-    if (!c || !CHANNEL_ID.test(c.id || '') || (c.type && c.type !== 'vtuber')) continue;
-    if (isMatchingChannel(c, q)) map.set(c.id, minimalChannel(c));
+    if (!Array.isArray(page) || !page.length) break;
+    for (const c of page) {
+      if (!c || !CHANNEL_ID.test(c.id || '') || (c.type && c.type !== 'vtuber')) continue;
+      if (isMatchingChannel(c, q)) map.set(c.id, minimalChannel(c));
+    }
+    if (map.size >= 10) break;
   }
   return [...map.values()]
     .sort((a, b) => channelScore(b, q) - channelScore(a, q))
@@ -126,20 +211,23 @@ async function searchCatalog(q, apiKey) {
 }
 
 async function searchChannels(q, apiKey) {
-  const primary = await searchAutocomplete(q, apiKey);
-  if (primary.length) return primary;
+  let found = await searchAutocomplete(q, apiKey);
+  if (found.length) return found;
+
+  found = await searchVideoIndex(q, apiKey);
+  if (found.length) return found;
+
   return searchCatalog(q, apiKey);
 }
 
 async function enrichLiveRows(rows, apiKey) {
   const arr = Array.isArray(rows) ? rows : [];
-  const ids = [...new Set(arr.map(v => v?.channel?.id || v?.channel_id).filter(id => CHANNEL_ID.test(id || '')))];
-  const channelMap = new Map();
+  const ids = [...new Set(arr
+    .map(v => v?.channel?.id || v?.channel_id)
+    .filter(id => CHANNEL_ID.test(id || '')))];
 
-  await Promise.all(ids.map(async id => {
-    const c = await getChannel(id, apiKey);
-    if (c) channelMap.set(id, c);
-  }));
+  const fetched = (await mapLimited(ids, 3, id => getChannel(id, apiKey))).filter(Boolean);
+  const channelMap = new Map(fetched.map(c => [c.id, c]));
 
   return arr.map(v => {
     const cid = v?.channel?.id || v?.channel_id || '';
@@ -150,29 +238,41 @@ async function enrichLiveRows(rows, apiKey) {
 
 async function handleHolodex(request, env, ctx) {
   if (!env.HOLODEX_API_KEY) {
-    return json({ error: 'サーバーのHolodex APIキーが未設定です。' }, 503);
+    return json({ error: 'サーバーのHolodex APIキーが未設定です。', workerVersion: VERSION }, 503);
   }
 
   const url = new URL(request.url);
   const action = url.searchParams.get('action') || '';
 
   try {
-    // 検索だけはキャッシュしない。修正前の空結果が残る事故を防ぐ。
     if (action === 'search') {
       const q = (url.searchParams.get('q') || '').trim().slice(0, 60);
-      if (!q) return json({ error: '検索語が空です。' }, 400);
+      if (!q) return json({ error: '検索語が空です。', workerVersion: VERSION }, 400);
       const payload = await searchChannels(q, env.HOLODEX_API_KEY);
       return json(payload, 200, 0);
     }
 
     if (action === 'health') {
-      return json({ ok: true, holodexKeyConfigured: true, workerVersion: 'search-fix-v3' });
+      let upstreamOk = false;
+      let upstreamStatus = null;
+      try {
+        await holodex('/channels/UC5CwaMl1eIgY8h02uZw7u8A', env.HOLODEX_API_KEY);
+        upstreamOk = true;
+      } catch (err) {
+        upstreamStatus = err?.status || null;
+      }
+      return json({
+        ok: true,
+        workerVersion: VERSION,
+        holodexKeyConfigured: true,
+        upstreamOk,
+        upstreamStatus
+      });
     }
 
     const cache = caches.default;
-    // Worker更新前のキャッシュと衝突しないようにバージョンをキーへ入れる。
     const cacheUrl = new URL(url.toString());
-    cacheUrl.searchParams.set('_worker', 'v3');
+    cacheUrl.searchParams.set('_worker', VERSION);
     const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
     const hit = await cache.match(cacheKey);
     if (hit) return hit;
@@ -195,7 +295,7 @@ async function handleHolodex(request, env, ctx) {
 
       if (!ids.length) return json([], 200, 60);
 
-      const data = await holodexGet(
+      const data = await holodex(
         '/users/live?channels=' + encodeURIComponent(ids.join(',')),
         env.HOLODEX_API_KEY
       );
@@ -209,10 +309,12 @@ async function handleHolodex(request, env, ctx) {
     if (ttl > 0) ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   } catch (err) {
-    console.error(err);
-    return json({
-      error: '配信情報サービスへの接続に失敗しました。少ししてから再試行してください。'
-    }, 502);
+    console.error('handleHolodex failed', err);
+    const status = err instanceof HolodexError ? err.status : null;
+    const message = status === 401 || status === 403
+      ? 'Holodex APIキーが拒否されました。CloudflareのRuntime Secretを確認してください。'
+      : '配信情報サービスへの接続に失敗しました。少ししてから再試行してください。';
+    return json({ error: message, workerVersion: VERSION, upstreamStatus: status }, 502);
   }
 }
 

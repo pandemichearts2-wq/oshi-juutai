@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v12-history';
+const VERSION = 'youtube-search-v13-discovery';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -178,7 +178,7 @@ async function youtubeVideoDetails(ids, apiKey) {
   const unique = [...new Set(ids)].filter(Boolean).slice(0, 50);
   if (!unique.length) return [];
   const params = new URLSearchParams({
-    part: 'snippet,liveStreamingDetails,contentDetails',
+    part: 'snippet,liveStreamingDetails,contentDetails,statistics',
     id: unique.join(','),
     maxResults: String(unique.length),
     key: apiKey
@@ -242,6 +242,134 @@ async function youtubeHistory(ids, apiKey) {
   const channels = await youtubeHistoryChannelSeeds(ids, apiKey);
   const groups = await mapLimited(channels, 3, c => youtubeHistoryForChannel(c, apiKey));
   return groups.flat();
+}
+
+function videoThumb(item) {
+  const t = item?.snippet?.thumbnails || {};
+  return t.maxres?.url || t.standard?.url || t.high?.url || t.medium?.url || t.default?.url || '';
+}
+
+function recommendationRow(item) {
+  const id = item?.id || '';
+  const sn = item?.snippet || {};
+  const live = item?.liveStreamingDetails || {};
+  const stats = item?.statistics || {};
+  if (!id) return null;
+  const isCompletedStream = !!(live.actualStartTime && live.actualEndTime);
+  return {
+    id,
+    title: sn.title || '(タイトルなし)',
+    thumb: videoThumb(item),
+    view_count: Number(stats.viewCount || 0) || 0,
+    published_at: sn.publishedAt || live.actualStartTime || '',
+    kind: isCompletedStream ? 'stream' : 'video'
+  };
+}
+
+async function bestRecentVideoForChannel(channelId, apiKey) {
+  const seeds = await youtubeHistoryChannelSeeds([channelId], apiKey);
+  const channel = seeds[0];
+  if (!channel?.uploads) return null;
+
+  const all = [];
+  let pageToken = '';
+  for (let page = 0; page < 2; page++) {
+    const list = await youtubePlaylistItems(channel.uploads, apiKey, pageToken);
+    const details = await youtubeVideoDetails(list.ids, apiKey);
+    for (const item of details) {
+      const row = recommendationRow(item);
+      if (row) all.push(row);
+    }
+    pageToken = list.nextPageToken;
+    if (!pageToken) break;
+  }
+
+  if (!all.length) return null;
+  const streams = all.filter(v => v.kind === 'stream');
+  const pool = streams.length ? streams : all;
+  return pool.sort((a, b) => b.view_count - a.view_count)[0] || null;
+}
+
+function randomPick(items) {
+  if (!Array.isArray(items) || !items.length) return null;
+  return items[Math.floor(Math.random() * items.length)] || null;
+}
+
+async function randomHolodexVtuber(apiKey, excluded = new Set()) {
+  // Holodex catalogからランダムなページを引き、登録済みを除外して1人選ぶ。
+  // 空ページに当たった場合は範囲を狭めて再試行する。
+  const ranges = [6000, 4500, 3000, 1800, 900, 300, 0];
+  for (const range of ranges) {
+    const offset = range > 0 ? Math.floor(Math.random() * range / 50) * 50 : 0;
+    let rows = [];
+    try {
+      rows = await holodex(`/channels?type=vtuber&limit=50&offset=${offset}&sort=subscriber_count&order=desc`, apiKey);
+    } catch (err) {
+      console.warn('discover catalog failed', offset, err?.status || '', err?.message || err);
+      continue;
+    }
+    const candidates = (Array.isArray(rows) ? rows : [])
+      .filter(c => c && CHANNEL_ID.test(c.id || ''))
+      .filter(c => !c.type || c.type === 'vtuber')
+      .filter(c => !excluded.has(c.id));
+    const picked = randomPick(candidates);
+    if (picked) return minimalChannel(picked);
+  }
+  return null;
+}
+
+async function calendarStreamsForChannels(ids, apiKey) {
+  const unique = [...new Set(ids)].filter(id => CHANNEL_ID.test(id)).slice(0, 20);
+  if (!unique.length) return [];
+  const groups = await mapLimited(unique, 4, async id => {
+    try {
+      const rows = await holodex(
+        `/videos?channel_id=${encodeURIComponent(id)}&status=upcoming&max_upcoming_hours=744&limit=50`,
+        apiKey
+      );
+      return Array.isArray(rows) ? rows : [];
+    } catch (err) {
+      console.warn('calendar channel failed', id, err?.status || '', err?.message || err);
+      return [];
+    }
+  });
+  const map = new Map();
+  for (const group of groups) {
+    for (const row of group) if (row?.id) map.set(row.id, row);
+  }
+  return enrichLiveRows([...map.values()], apiKey);
+}
+
+async function discoverVtuber(excludeIds, holodexKey, youtubeKey) {
+  const excluded = new Set((excludeIds || []).filter(id => CHANNEL_ID.test(id)));
+  const picked = await randomHolodexVtuber(holodexKey, excluded);
+  if (!picked) return { channel: null, video: null };
+
+  let channel = picked;
+  try {
+    const ytRows = await youtubeChannelsByIds([picked.id], youtubeKey);
+    const yt = youtubeChannelFromDetail(ytRows[0]);
+    if (yt) {
+      channel = {
+        ...picked,
+        ...yt,
+        english_name: picked.english_name || yt.english_name || '',
+        org: picked.org || yt.org || '',
+        holodex_verified: true
+      };
+    }
+  } catch (err) {
+    console.warn('discover channel enrich failed', picked.id, err?.status || '', err?.message || err);
+  }
+
+  let video = null;
+  try {
+    video = await bestRecentVideoForChannel(picked.id, youtubeKey);
+  } catch (err) {
+    console.warn('discover video failed', picked.id, err?.status || '', err?.message || err);
+  }
+
+  return { channel, video };
 }
 
 function youtubeChannelFromDetail(item) {
@@ -869,6 +997,37 @@ async function handleHolodex(request, env, ctx) {
     }
   }
 
+  if (action === 'discover') {
+    const excludeIds = [...new Set(
+      (url.searchParams.get('exclude') || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(id => CHANNEL_ID.test(id))
+    )].slice(0, 60);
+
+    if (!env.HOLODEX_API_KEY || !env.YOUTUBE_API_KEY) {
+      return json({
+        error: '新規開拓にはHolodex APIキーとYouTube APIキーの両方が必要です。',
+        workerVersion: VERSION
+      }, 503);
+    }
+
+    try {
+      const payload = await discoverVtuber(excludeIds, env.HOLODEX_API_KEY, env.YOUTUBE_API_KEY);
+      if (!payload?.channel) {
+        return json({ error: '未登録のVTuber候補を見つけられませんでした。', workerVersion: VERSION }, 404);
+      }
+      return json(payload, 200, 0);
+    } catch (err) {
+      console.error('discover failed', err);
+      return json({
+        error: '新しいVTuberの取得に失敗しました。少ししてからもう一度試してください。',
+        workerVersion: VERSION,
+        upstreamStatus: err?.status || null
+      }, 502);
+    }
+  }
+
   if (action === 'health') {
     let holodexUpstreamOk = false;
     let holodexUpstreamStatus = null;
@@ -925,6 +1084,17 @@ async function handleHolodex(request, env, ctx) {
 
       payload = c;
       ttl = 86400;
+    } else if (action === 'calendar') {
+      const ids = [...new Set(
+        (url.searchParams.get('ids') || '')
+          .split(',')
+          .map(s => s.trim())
+          .filter(id => CHANNEL_ID.test(id))
+      )].slice(0, 20);
+
+      if (!ids.length) return json([], 200, 300);
+      payload = await calendarStreamsForChannels(ids, env.HOLODEX_API_KEY);
+      ttl = 300;
     } else if (action === 'live') {
       const ids = [...new Set(
         (url.searchParams.get('ids') || '')

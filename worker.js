@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v13-discovery';
+const VERSION = 'youtube-search-v14-live-fallback';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -191,6 +191,155 @@ async function youtubeVideoDetails(ids, apiKey) {
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch { throw new Error('YouTube returned invalid JSON'); }
   return Array.isArray(data?.items) ? data.items : [];
+}
+
+
+function splitIntoChunks(items, size = 50) {
+  const arr = Array.isArray(items) ? items : [];
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function youtubeFeedVideoIds(channelId) {
+  if (!CHANNEL_ID.test(channelId || '')) return [];
+
+  const res = await fetch(
+    'https://www.youtube.com/feeds/videos.xml?channel_id=' + encodeURIComponent(channelId),
+    {
+      headers: {
+        'Accept': 'application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.1',
+        'User-Agent': 'Mozilla/5.0'
+      }
+    }
+  );
+
+  const text = await res.text();
+  if (!res.ok) throw new YouTubeError(res.status, text.slice(0, 500));
+
+  const ids = [];
+  const seen = new Set();
+  const re = /<yt:videoId>([^<]+)<\/yt:videoId>/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const id = String(m[1] || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 15) break;
+  }
+  return ids;
+}
+
+async function youtubeVideoDetailsAll(ids, apiKey) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  if (!unique.length) return [];
+
+  const chunks = splitIntoChunks(unique, 50);
+  const groups = await mapLimited(chunks, 3, chunk => youtubeVideoDetails(chunk, apiKey));
+  return groups.flat();
+}
+
+function youtubeLiveRow(item, channelMap = new Map()) {
+  const id = item?.id || '';
+  const sn = item?.snippet || {};
+  const live = item?.liveStreamingDetails || {};
+  const channelId = sn.channelId || '';
+
+  // actualStartTime があり、actualEndTime がまだ無いものだけを「現在LIVE」とする。
+  if (!id || !CHANNEL_ID.test(channelId) || !live.actualStartTime || live.actualEndTime) return null;
+
+  const c = channelMap.get(channelId) || null;
+  const viewers = Number(live.concurrentViewers || 0) || 0;
+
+  return {
+    id,
+    title: sn.title || '(タイトルなし)',
+    desc: sn.description || '',
+    description: sn.description || '',
+    status: 'live',
+    type: 'stream',
+    start_scheduled: live.scheduledStartTime || live.actualStartTime,
+    start_actual: live.actualStartTime,
+    published_at: sn.publishedAt || live.actualStartTime,
+    live_viewers: viewers,
+    channel_id: channelId,
+    channel: {
+      id: channelId,
+      name: c?.name || sn.channelTitle || channelId,
+      english_name: c?.english_name || '',
+      photo: c?.photo || '',
+      thumbnail: c?.thumbnail || c?.photo || '',
+      org: c?.org || '',
+      type: 'vtuber',
+      lang: c?.lang || sn.defaultLanguage || sn.defaultAudioLanguage || ''
+    },
+    source: 'youtube-live-fallback'
+  };
+}
+
+async function youtubeLiveFallback(channelIds, apiKey) {
+  const unique = [...new Set(channelIds || [])]
+    .filter(id => CHANNEL_ID.test(id || ''))
+    .slice(0, 20);
+  if (!unique.length || !apiKey) return [];
+
+  // YouTube側の確認は検索APIをチャンネル数分叩かない。
+  // 各チャンネルの公式Atomフィードから直近動画IDだけを拾い、
+  // videos.list を50件ずつまとめて照会して現在LIVEかを確定する。
+  // これなら search.list の大量クォータ消費を避けながら補完できる。
+  const feedGroups = await mapLimited(unique, 5, async channelId => {
+    try {
+      const videoIds = await youtubeFeedVideoIds(channelId);
+      return { channelId, videoIds };
+    } catch (err) {
+      console.warn('YouTube live fallback feed failed', channelId, err?.status || '', err?.message || err);
+      return { channelId, videoIds: [] };
+    }
+  });
+
+  const candidateIds = [...new Set(feedGroups.flatMap(x => x.videoIds || []))];
+  if (!candidateIds.length) return [];
+
+  let details = [];
+  try {
+    details = await youtubeVideoDetailsAll(candidateIds, apiKey);
+  } catch (err) {
+    console.warn('YouTube live fallback videos.list failed', err?.status || '', err?.message || err);
+    return [];
+  }
+
+  const targetSet = new Set(unique);
+  const liveItems = details.filter(item => {
+    const channelId = item?.snippet?.channelId || '';
+    const live = item?.liveStreamingDetails || {};
+    return targetSet.has(channelId) && !!live.actualStartTime && !live.actualEndTime;
+  });
+  if (!liveItems.length) return [];
+
+  // LIVEが実際に見つかったチャンネルだけ、YouTubeからアイコン等を補完する。
+  const liveChannelIds = [...new Set(
+    liveItems
+      .map(item => item?.snippet?.channelId || '')
+      .filter(id => CHANNEL_ID.test(id))
+  )];
+
+  let channelMap = new Map();
+  try {
+    const channelRows = await youtubeChannelsByIds(liveChannelIds, apiKey);
+    channelMap = new Map(
+      channelRows
+        .map(youtubeChannelFromDetail)
+        .filter(Boolean)
+        .map(c => [c.id, c])
+    );
+  } catch (err) {
+    console.warn('YouTube live fallback channel enrich failed', err?.status || '', err?.message || err);
+  }
+
+  return liveItems
+    .map(item => youtubeLiveRow(item, channelMap))
+    .filter(Boolean);
 }
 
 function historyVideoRow(item, channel) {
@@ -1105,12 +1254,40 @@ async function handleHolodex(request, env, ctx) {
 
       if (!ids.length) return json([], 200, 60);
 
+      // 1) まずHolodexを優先して、登録中の推しのLIVE / Upcomingを取得。
       const data = await holodex(
         '/users/live?channels=' + encodeURIComponent(ids.join(',')),
         env.HOLODEX_API_KEY
       );
 
-      payload = await enrichLiveRows(data, env.HOLODEX_API_KEY);
+      const holodexRows = Array.isArray(data) ? data : [];
+      const holodexLiveChannelIds = new Set(
+        holodexRows
+          .filter(v => v?.status === 'live')
+          .map(v => v?.channel?.id || v?.channel_id || '')
+          .filter(id => CHANNEL_ID.test(id))
+      );
+
+      // 2) Holodexで「現在LIVE」が見つからなかった登録チャンネルだけYouTube側を確認。
+      const youtubeCheckIds = ids.filter(id => !holodexLiveChannelIds.has(id));
+      let youtubeFallbackRows = [];
+
+      if (youtubeCheckIds.length && env.YOUTUBE_API_KEY) {
+        try {
+          youtubeFallbackRows = await youtubeLiveFallback(youtubeCheckIds, env.YOUTUBE_API_KEY);
+        } catch (err) {
+          // YouTube補完が失敗してもHolodexの結果はそのまま返す。
+          console.warn('YouTube live fallback failed', err?.status || '', err?.message || err);
+          youtubeFallbackRows = [];
+        }
+      }
+
+      // 3) YouTubeでLIVE確認できた配信を追加。動画IDが重なったらYouTube側のLIVE判定を優先。
+      const merged = new Map();
+      for (const row of holodexRows) if (row?.id) merged.set(row.id, row);
+      for (const row of youtubeFallbackRows) if (row?.id) merged.set(row.id, row);
+
+      payload = await enrichLiveRows([...merged.values()], env.HOLODEX_API_KEY);
       ttl = 90;
     } else {
       return json({ error: '不明なAPI操作です。' }, 400);

@@ -1445,8 +1445,6 @@ async function handleNotify(request, env) {
 }
 
 
-const CONTACT_TO_EMAIL = 'pandemic-hearts@softbank.ne.jp';
-
 async function handleContact(request, env) {
   if (request.method !== 'POST') return notifyJson({ error: 'Method Not Allowed' }, 405);
   const contentLength = Number(request.headers.get('content-length') || 0);
@@ -1465,9 +1463,14 @@ async function handleContact(request, env) {
   if (!subject || subject.length > 120) return notifyJson({ error: '件名は1〜120文字で入力してください。' }, 400);
   if (!body || body.length > 10000) return notifyJson({ error: '本文は1〜10000文字で入力してください。' }, 400);
 
+  const contactTo = String(env.CONTACT_TO_EMAIL || '').trim();
+  if (!contactTo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactTo)) {
+    return notifyJson({ error: '問い合わせ先メールアドレスが未設定です。' }, 500);
+  }
+
   const mailSubject = `【Vduleお問い合わせ】${subject}`;
-  const mailBody = `Vduleのお問い合わせフォームから送信されました。\n\n返信先アドレス\n${replyEmail}\n\n件名\n${subject}\n\n本文（詳細）\n${body}\n\n---------------------------------------------\n送信元: Vdule お問い合わせフォーム`;
-  await sendGasMail(env, CONTACT_TO_EMAIL, mailSubject, mailBody);
+  const mailBody = `Vduleのお問い合わせフォームから送信されました。\n\n返信先アドレス（この方へ返信）\n${replyEmail}\n\n件名\n${subject}\n\n本文（詳細）\n${body}\n\n---------------------------------------------\n送信元: Vdule お問い合わせフォーム`;
+  await sendGasMail(env, contactTo, mailSubject, mailBody);
   return notifyJson({ ok: true });
 }
 

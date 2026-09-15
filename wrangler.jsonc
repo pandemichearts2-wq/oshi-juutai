@@ -7,5 +7,18 @@
     "directory": "./public",
     "binding": "ASSETS",
     "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "NOTIFY_DB",
+      "database_name": "oshi-juutai-notify",
+      "database_id": "ここをCloudflareで作成したD1のDatabase IDに置き換える"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "vars": {
+    "NOTIFY_FROM_EMAIL": "Vdule <notify@あなたの送信用ドメイン>"
   }
 }

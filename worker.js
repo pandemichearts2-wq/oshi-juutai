@@ -1,6 +1,8 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v15-data-analysis';
+const VERSION = 'youtube-search-v17-email-notify-capacity';
+const MAX_NOTIFY_SUBSCRIBERS = 20;
+const NOTIFY_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
 
 function json(data, status = 200, ttl = 0) {
@@ -1143,6 +1145,368 @@ async function enrichLiveRows(rows, apiKey) {
   });
 }
 
+
+function notifyJson(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store'
+    }
+  });
+}
+
+function validNotifyEmail(value) {
+  const email = String(value || '').trim();
+  return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validNotifyToken(value) {
+  return /^[A-Za-z0-9_-]{20,120}$/.test(String(value || ''));
+}
+
+function makeNotifyToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let raw = '';
+  for (const b of bytes) raw += String.fromCharCode(b);
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function sanitizeNotifyChannels(input) {
+  const out = new Map();
+  for (const row of Array.isArray(input) ? input : []) {
+    const id = String(row?.id || '').trim();
+    if (!CHANNEL_ID.test(id)) continue;
+    const name = String(row?.name || id).trim().slice(0, 120) || id;
+    if (!out.has(id)) out.set(id, { id, name });
+    if (out.size >= 20) break;
+  }
+  return [...out.values()];
+}
+
+async function ensureNotifySchema(env) {
+  if (!env.NOTIFY_DB) throw new Error('通知用D1データベースが未設定です。');
+  await env.NOTIFY_DB.batch([
+    env.NOTIFY_DB.prepare(`CREATE TABLE IF NOT EXISTS notify_subscriptions (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0,
+      verify_key TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`),
+    env.NOTIFY_DB.prepare(`CREATE TABLE IF NOT EXISTS notify_channels (
+      token TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      channel_name TEXT NOT NULL,
+      added_at TEXT NOT NULL,
+      PRIMARY KEY (token, channel_id)
+    )`),
+    env.NOTIFY_DB.prepare(`CREATE TABLE IF NOT EXISTS notify_sent (
+      token TEXT NOT NULL,
+      video_id TEXT NOT NULL,
+      sent_at TEXT NOT NULL,
+      PRIMARY KEY (token, video_id)
+    )`),
+    env.NOTIFY_DB.prepare('CREATE INDEX IF NOT EXISTS idx_notify_channels_channel ON notify_channels(channel_id)'),
+    env.NOTIFY_DB.prepare('CREATE INDEX IF NOT EXISTS idx_notify_sent_time ON notify_sent(sent_at)')
+  ]);
+}
+
+async function cleanupExpiredNotifyPending(env) {
+  const cutoff = new Date(Date.now() - NOTIFY_PENDING_TTL_MS).toISOString();
+  const rows = await env.NOTIFY_DB.prepare(
+    'SELECT token FROM notify_subscriptions WHERE verified = 0 AND created_at < ?'
+  ).bind(cutoff).all();
+  const tokens = (rows.results || []).map(r => String(r.token || '')).filter(validNotifyToken);
+  if (!tokens.length) return;
+  const statements = [];
+  for (const token of tokens) {
+    statements.push(env.NOTIFY_DB.prepare('DELETE FROM notify_sent WHERE token = ?').bind(token));
+    statements.push(env.NOTIFY_DB.prepare('DELETE FROM notify_channels WHERE token = ?').bind(token));
+    statements.push(env.NOTIFY_DB.prepare('DELETE FROM notify_subscriptions WHERE token = ?').bind(token));
+  }
+  for (let i = 0; i < statements.length; i += 30) {
+    await env.NOTIFY_DB.batch(statements.slice(i, i + 30));
+  }
+}
+
+async function notifyCapacityData(env, token = '') {
+  await cleanupExpiredNotifyPending(env);
+  const countRow = await env.NOTIFY_DB.prepare('SELECT COUNT(*) AS count FROM notify_subscriptions').first();
+  const used = Math.max(0, Number(countRow?.count || 0));
+  let currentRegistered = false;
+  if (validNotifyToken(token)) {
+    const row = await env.NOTIFY_DB.prepare('SELECT 1 AS ok FROM notify_subscriptions WHERE token = ?').bind(token).first();
+    currentRegistered = !!row?.ok;
+  }
+  const remaining = Math.max(0, MAX_NOTIFY_SUBSCRIBERS - used);
+  return { max: MAX_NOTIFY_SUBSCRIBERS, used, remaining, full: remaining <= 0, currentRegistered };
+}
+
+async function notifyCapacity(request, env) {
+  await ensureNotifySchema(env);
+  let body = null;
+  try { body = await request.json(); } catch {}
+  const token = String(body?.token || '');
+  return notifyJson(await notifyCapacityData(env, token));
+}
+
+async function seedExistingUpcomingForToken(env, token, channelIds) {
+  const ids = [...new Set(channelIds || [])].filter(id => CHANNEL_ID.test(id)).slice(0, 20);
+  if (!ids.length || !env.HOLODEX_API_KEY) return;
+  try {
+    const rows = await calendarStreamsForChannels(ids, env.HOLODEX_API_KEY);
+    const now = new Date().toISOString();
+    const statements = (Array.isArray(rows) ? rows : [])
+      .filter(v => v?.id)
+      .map(v => env.NOTIFY_DB.prepare(
+        'INSERT OR IGNORE INTO notify_sent (token, video_id, sent_at) VALUES (?, ?, ?)'
+      ).bind(token, String(v.id), now));
+    if (statements.length) await env.NOTIFY_DB.batch(statements);
+  } catch (err) {
+    console.warn('notify baseline seed failed', err?.message || err);
+  }
+}
+
+async function upsertNotifySubscription(request, env) {
+  await ensureNotifySchema(env);
+  await cleanupExpiredNotifyPending(env);
+  let body = null;
+  try { body = await request.json(); } catch {}
+  body = body || {};
+  const email = String(body.email || '').trim().toLowerCase();
+  if (!validNotifyEmail(email)) return notifyJson({ error: 'メールアドレスの形式を確認してください。' }, 400);
+  const channels = sanitizeNotifyChannels(body.channels);
+  let token = validNotifyToken(body.token) ? String(body.token) : '';
+  let existing = null;
+  if (token) existing = await env.NOTIFY_DB.prepare('SELECT token, email, verified, verify_key, created_at FROM notify_subscriptions WHERE token = ?').bind(token).first();
+
+  const duplicate = await env.NOTIFY_DB.prepare(
+    'SELECT token FROM notify_subscriptions WHERE lower(email) = lower(?) AND token <> ? LIMIT 1'
+  ).bind(email, existing?.token || token || '').first();
+  if (duplicate?.token) {
+    const capacity = await notifyCapacityData(env, token);
+    return notifyJson({ ...capacity, error: 'このメールアドレスはすでに登録されています。登録した端末から設定を変更してください。' }, 409);
+  }
+
+  if (!existing) {
+    const capacity = await notifyCapacityData(env, '');
+    if (capacity.full) {
+      return notifyJson({ ...capacity, error: `メール通知は現在${MAX_NOTIFY_SUBSCRIBERS}人の受付上限に達しています。` }, 409);
+    }
+    token = makeNotifyToken();
+  }
+
+  const oldRows = existing
+    ? await env.NOTIFY_DB.prepare('SELECT channel_id, added_at FROM notify_channels WHERE token = ?').bind(token).all()
+    : { results: [] };
+  const oldAdded = new Map((oldRows.results || []).map(r => [r.channel_id, r.added_at]));
+  const now = new Date().toISOString();
+  const createdAt = existing?.created_at || now;
+  const emailChanged = !existing || String(existing.email || '') !== email;
+  const verified = emailChanged ? 0 : Number(existing?.verified || 0);
+  const verifyKey = emailChanged ? makeNotifyToken() : (existing?.verify_key || null);
+  const addedChannelIds = channels.filter(c => !oldAdded.has(c.id)).map(c => c.id);
+
+  const statements = [
+    env.NOTIFY_DB.prepare(`INSERT INTO notify_subscriptions (token, email, verified, verify_key, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(token) DO UPDATE SET email = excluded.email, verified = excluded.verified, verify_key = excluded.verify_key, updated_at = excluded.updated_at`)
+      .bind(token, email, verified, verifyKey, createdAt, now),
+    env.NOTIFY_DB.prepare('DELETE FROM notify_channels WHERE token = ?').bind(token)
+  ];
+  for (const c of channels) {
+    statements.push(env.NOTIFY_DB.prepare(
+      'INSERT INTO notify_channels (token, channel_id, channel_name, added_at) VALUES (?, ?, ?, ?)'
+    ).bind(token, c.id, c.name, oldAdded.get(c.id) || now));
+  }
+  await env.NOTIFY_DB.batch(statements);
+  await seedExistingUpcomingForToken(env, token, addedChannelIds);
+  let confirmationSent = false;
+  if (!verified && (emailChanged || !existing)) {
+    await sendVerificationEmail(env, email, token, verifyKey, new URL(request.url).origin);
+    confirmationSent = true;
+  }
+  const capacity = await notifyCapacityData(env, token);
+  return notifyJson({ ok: true, token, email, verified: !!verified, confirmationSent, channelCount: channels.length, capacity });
+}
+
+async function deleteNotifySubscription(request, env) {
+  await ensureNotifySchema(env);
+  let body = null;
+  try { body = await request.json(); } catch {}
+  const token = String(body?.token || '');
+  if (!validNotifyToken(token)) return notifyJson({ ok: true });
+  await env.NOTIFY_DB.batch([
+    env.NOTIFY_DB.prepare('DELETE FROM notify_sent WHERE token = ?').bind(token),
+    env.NOTIFY_DB.prepare('DELETE FROM notify_channels WHERE token = ?').bind(token),
+    env.NOTIFY_DB.prepare('DELETE FROM notify_subscriptions WHERE token = ?').bind(token)
+  ]);
+  const capacity = await notifyCapacityData(env, '');
+  return notifyJson({ ok: true, capacity });
+}
+
+async function handleNotify(request, env) {
+  const url = new URL(request.url);
+  try {
+    if (url.pathname === '/api/notify/confirm' && request.method === 'GET') return await confirmNotifySubscription(request, env);
+    if (request.method !== 'POST') return notifyJson({ error: 'Method Not Allowed' }, 405);
+    if (url.pathname === '/api/notify/capacity') return await notifyCapacity(request, env);
+    if (url.pathname === '/api/notify/register') return await upsertNotifySubscription(request, env);
+    if (url.pathname === '/api/notify/delete') return await deleteNotifySubscription(request, env);
+    return notifyJson({ error: '不明な通知APIです。' }, 404);
+  } catch (err) {
+    console.error('notify api failed', err);
+    return notifyJson({ error: err?.message || '通知設定を保存できませんでした。' }, 500);
+  }
+}
+
+function chunksOf(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+async function sendVerificationEmail(env, to, token, verifyKey, origin) {
+  if (!env.RESEND_API_KEY || !env.NOTIFY_FROM_EMAIL) {
+    throw new Error('メール送信用のRESEND_API_KEY / NOTIFY_FROM_EMAILが未設定です。');
+  }
+  const confirmUrl = `${origin}/api/notify/confirm?token=${encodeURIComponent(token)}&key=${encodeURIComponent(verifyKey)}`;
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: env.NOTIFY_FROM_EMAIL,
+      to: [to],
+      subject: '【Vdule】配信予定メール通知の確認',
+      text: `Vduleの配信予定メール通知を有効にします。\n\n以下のリンクを開いて登録を完了してください。\n${confirmUrl}`
+    })
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = await res.text(); } catch {}
+    throw new Error(`確認メールを送信できませんでした (Resend ${res.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
+async function confirmNotifySubscription(request, env) {
+  await ensureNotifySchema(env);
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token') || '';
+  const key = url.searchParams.get('key') || '';
+  if (!validNotifyToken(token) || !validNotifyToken(key)) {
+    return Response.redirect(new URL('/?notify=invalid', url).toString(), 302);
+  }
+  const row = await env.NOTIFY_DB.prepare(
+    'SELECT token FROM notify_subscriptions WHERE token = ? AND verify_key = ?'
+  ).bind(token, key).first();
+  if (!row?.token) return Response.redirect(new URL('/?notify=invalid', url).toString(), 302);
+  await env.NOTIFY_DB.prepare(
+    'UPDATE notify_subscriptions SET verified = 1, verify_key = NULL, updated_at = ? WHERE token = ?'
+  ).bind(new Date().toISOString(), token).run();
+  return Response.redirect(new URL('/?notify=confirmed', url).toString(), 302);
+}
+
+async function sendNotifyEmail(env, to, channelName, videoId) {
+  if (!env.RESEND_API_KEY || !env.NOTIFY_FROM_EMAIL) {
+    throw new Error('メール送信用のRESEND_API_KEY / NOTIFY_FROM_EMAILが未設定です。');
+  }
+  const link = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+  const text = `---------------------------------------------\n${channelName}\nの配信予定が入りました📢\n\n↓↓通知をＯＮにしに行く↓↓\n${link}\n---------------------------------------------`;
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: env.NOTIFY_FROM_EMAIL,
+      to: [to],
+      subject: `【Vdule】${channelName}の配信予定が入りました`,
+      text
+    })
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = await res.text(); } catch {}
+    throw new Error(`Resend ${res.status}: ${detail.slice(0, 300)}`);
+  }
+}
+
+async function runNotificationCron(env) {
+  if (!env.NOTIFY_DB || !env.HOLODEX_API_KEY) return;
+  await ensureNotifySchema(env);
+  if (!env.RESEND_API_KEY || !env.NOTIFY_FROM_EMAIL) {
+    console.warn('notification cron skipped: mail provider not configured');
+    return;
+  }
+
+  const channelRows = await env.NOTIFY_DB.prepare('SELECT DISTINCT channel_id FROM notify_channels').all();
+  const channelIds = (channelRows.results || []).map(r => r.channel_id).filter(id => CHANNEL_ID.test(id));
+  if (!channelIds.length) return;
+
+  const streamMap = new Map();
+  for (const group of chunksOf(channelIds, 20)) {
+    try {
+      const rows = await calendarStreamsForChannels(group, env.HOLODEX_API_KEY);
+      for (const row of Array.isArray(rows) ? rows : []) if (row?.id) streamMap.set(row.id, row);
+    } catch (err) {
+      console.warn('notification calendar check failed', err?.message || err);
+    }
+  }
+
+  const byChannel = new Map();
+  for (const row of streamMap.values()) {
+    const cid = row?.channel?.id || row?.channel_id || '';
+    if (!CHANNEL_ID.test(cid)) continue;
+    if (!byChannel.has(cid)) byChannel.set(cid, []);
+    byChannel.get(cid).push(row);
+  }
+
+  for (const [channelId, rows] of byChannel) {
+    const subs = await env.NOTIFY_DB.prepare(`SELECT s.token, s.email, c.channel_name, c.added_at
+      FROM notify_channels c
+      JOIN notify_subscriptions s ON s.token = c.token
+      WHERE c.channel_id = ? AND s.verified = 1`).bind(channelId).all();
+    for (const sub of subs.results || []) {
+      for (const row of rows) {
+        const videoId = String(row?.id || '');
+        if (!videoId) continue;
+        const exists = await env.NOTIFY_DB.prepare(
+          'SELECT 1 AS ok FROM notify_sent WHERE token = ? AND video_id = ?'
+        ).bind(sub.token, videoId).first();
+        if (exists?.ok) continue;
+
+        const published = new Date(row?.published_at || 0).getTime();
+        const added = new Date(sub.added_at || 0).getTime();
+        if (Number.isFinite(published) && Number.isFinite(added) && published > 0 && published <= added) {
+          await env.NOTIFY_DB.prepare(
+            'INSERT OR IGNORE INTO notify_sent (token, video_id, sent_at) VALUES (?, ?, ?)'
+          ).bind(sub.token, videoId, new Date().toISOString()).run();
+          continue;
+        }
+
+        try {
+          await sendNotifyEmail(env, sub.email, sub.channel_name || row?.channel?.name || '登録中のVTuber', videoId);
+          await env.NOTIFY_DB.prepare(
+            'INSERT OR IGNORE INTO notify_sent (token, video_id, sent_at) VALUES (?, ?, ?)'
+          ).bind(sub.token, videoId, new Date().toISOString()).run();
+        } catch (err) {
+          console.error('notification send failed', sub.email, videoId, err?.message || err);
+        }
+      }
+    }
+  }
+
+  const cutoff = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString();
+  await env.NOTIFY_DB.prepare('DELETE FROM notify_sent WHERE sent_at < ?').bind(cutoff).run();
+}
+
 async function handleHolodex(request, env, ctx) {
   const url = new URL(request.url);
   const action = url.searchParams.get('action') || '';
@@ -1471,6 +1835,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (url.pathname.startsWith('/api/notify/')) {
+      return handleNotify(request, env);
+    }
+
     if (url.pathname === '/api/holodex') {
       if (request.method !== 'GET') {
         return json({ error: 'Method Not Allowed' }, 405);
@@ -1480,6 +1848,10 @@ export default {
     }
 
     return env.ASSETS.fetch(request);
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runNotificationCron(env));
   }
 };
 　

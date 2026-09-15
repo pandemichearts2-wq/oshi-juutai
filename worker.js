@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v20-gas-analysis-media-breakdown';
+const VERSION = 'youtube-search-v21-gas-contact-form';
 const MAX_NOTIFY_SUBSCRIBERS = 20;
 const NOTIFY_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -1444,6 +1444,33 @@ async function handleNotify(request, env) {
   }
 }
 
+
+const CONTACT_TO_EMAIL = 'pandemic-hearts@softbank.ne.jp';
+
+async function handleContact(request, env) {
+  if (request.method !== 'POST') return notifyJson({ error: 'Method Not Allowed' }, 405);
+  const contentLength = Number(request.headers.get('content-length') || 0);
+  if (Number.isFinite(contentLength) && contentLength > 30000) return notifyJson({ error: '送信内容が大きすぎます。' }, 413);
+
+  let data = null;
+  try { data = await request.json(); } catch { return notifyJson({ error: '入力内容を読み取れませんでした。' }, 400); }
+  const replyEmail = String(data?.replyEmail || '').trim().toLowerCase();
+  const subject = String(data?.subject || '').trim();
+  const body = String(data?.body || '').trim();
+  const website = String(data?.website || '').trim();
+
+  // Hidden honeypot: bots that fill hidden fields are accepted without sending mail.
+  if (website) return notifyJson({ ok: true });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(replyEmail) || replyEmail.length > 254) return notifyJson({ error: '返信先アドレスを確認してください。' }, 400);
+  if (!subject || subject.length > 120) return notifyJson({ error: '件名は1〜120文字で入力してください。' }, 400);
+  if (!body || body.length > 10000) return notifyJson({ error: '本文は1〜10000文字で入力してください。' }, 400);
+
+  const mailSubject = `【Vduleお問い合わせ】${subject}`;
+  const mailBody = `Vduleのお問い合わせフォームから送信されました。\n\n返信先アドレス\n${replyEmail}\n\n件名\n${subject}\n\n本文（詳細）\n${body}\n\n---------------------------------------------\n送信元: Vdule お問い合わせフォーム`;
+  await sendGasMail(env, CONTACT_TO_EMAIL, mailSubject, mailBody);
+  return notifyJson({ ok: true });
+}
+
 function chunksOf(items, size) {
   const out = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
@@ -1911,6 +1938,10 @@ async function handleHolodex(request, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === '/api/contact') {
+      try { return await handleContact(request, env); } catch (err) { console.error('contact api failed', err); return notifyJson({ error: '問い合わせを送信できませんでした。' }, 500); }
+    }
 
     if (url.pathname.startsWith('/api/notify/')) {
       return handleNotify(request, env);

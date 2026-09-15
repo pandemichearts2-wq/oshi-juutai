@@ -124,6 +124,45 @@ linear-gradient(180deg,#343a67 0%,#30375f 55%,#394573 100%);box-shadow:0 18px 50
   *,*::before,*::after{scroll-behavior:auto!important}
 }
 
+
+
+/* Vdule motion UI v2 — stronger visual feedback only. No API/storage/business logic changes. */
+@media (prefers-reduced-motion:no-preference){
+  @keyframes vdulePageInStrong{0%{opacity:.08;transform:translateY(22px) scale(.988)}65%{opacity:1;transform:translateY(-2px) scale(1.002)}100%{opacity:1;transform:none}}
+  @keyframes vduleCardInStrong{0%{opacity:0;transform:translateY(18px) scale(.975)}72%{opacity:1;transform:translateY(-2px) scale(1.004)}100%{opacity:1;transform:none}}
+  @keyframes vduleModalStrong{0%{opacity:0;transform:translateY(12px) scale(.91)}72%{opacity:1;transform:translateY(-2px) scale(1.015)}100%{opacity:1;transform:none}}
+  @keyframes vduleLivePulseStrong{0%,100%{box-shadow:0 0 0 3px rgba(255,85,119,.13),0 0 0 0 rgba(255,85,119,.22)}50%{box-shadow:0 0 0 5px rgba(255,85,119,.10),0 0 0 11px rgba(255,85,119,0)}}
+  @keyframes vdulePieDrawStrong{0%{opacity:.18;transform:rotate(-72deg) scale(.68)}68%{opacity:1;transform:rotate(5deg) scale(1.035)}100%{opacity:1;transform:none}}
+  @keyframes vduleValueIn{0%{opacity:.1;transform:translateY(8px) scale(.88)}70%{opacity:1;transform:translateY(-1px) scale(1.045)}100%{opacity:1;transform:none}}
+  @keyframes vdulePillSweep{0%{transform:translateX(-160%) skewX(-20deg);opacity:0}25%{opacity:.38}100%{transform:translateX(220%) skewX(-20deg);opacity:0}}
+  @keyframes vduleRefreshTap{0%{transform:scale(1)}35%{transform:scale(.93) rotate(-2deg)}70%{transform:scale(1.035) rotate(1deg)}100%{transform:none}}
+
+  .page-view.active{animation:vdulePageInStrong .46s cubic-bezier(.18,.82,.22,1) both}
+  .modal-bg.open .modal{animation:vduleModalStrong .32s cubic-bezier(.18,.82,.22,1) both}
+  .status-dot.live{animation:vduleLivePulseStrong 1.55s ease-in-out infinite}
+
+  .stats .stat,.stream-list .stream,.analysis-card,.analysis-chart-card{animation:vduleCardInStrong .44s cubic-bezier(.18,.82,.22,1) both}
+  .stats .stat:nth-child(2){animation-delay:.06s}.stats .stat:nth-child(3){animation-delay:.12s}.stats .stat:nth-child(4){animation-delay:.18s}
+  .stream-list .stream:nth-child(2){animation-delay:.055s}.stream-list .stream:nth-child(3){animation-delay:.11s}.stream-list .stream:nth-child(4){animation-delay:.165s}.stream-list .stream:nth-child(5){animation-delay:.22s}.stream-list .stream:nth-child(6){animation-delay:.275s}
+  .analysis-card:nth-child(2){animation-delay:.045s}.analysis-card:nth-child(3){animation-delay:.09s}.analysis-card:nth-child(4){animation-delay:.135s}.analysis-card:nth-child(5){animation-delay:.18s}.analysis-card:nth-child(6){animation-delay:.225s}.analysis-card:nth-child(7){animation-delay:.27s}.analysis-card:nth-child(8){animation-delay:.315s}.analysis-card:nth-child(9){animation-delay:.36s}
+  .analysis-chart-card:nth-child(2){animation-delay:.08s}.analysis-chart-card:nth-child(3){animation-delay:.16s}
+
+  .analysis-pie.vdule-pie-reveal{animation:vdulePieDrawStrong .72s cubic-bezier(.16,.84,.2,1) both}
+  .analysis-card-value.vdule-counting,.analysis-pie-center b.vdule-counting{animation:vduleValueIn .34s ease-out both}
+
+  .navbtn,.tab,.analysis-period-btn{position:relative;overflow:hidden}
+  .navbtn.active::after,.tab.active::after,.analysis-period-btn.active::after{content:"";position:absolute;inset:-40% auto -40% -24%;width:32%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent);pointer-events:none;animation:vdulePillSweep .58s ease-out both}
+
+  .refresh.vdule-refresh-tap{animation:vduleRefreshTap .52s ease-out both}
+  .vdule-click-pop{animation:vduleRefreshTap .34s ease-out both!important}
+
+  @media (hover:hover) and (pointer:fine){
+    .stream:hover{transform:translateY(-4px) scale(1.003);box-shadow:0 14px 30px rgba(75,79,145,.13)}
+    .analysis-card:hover,.analysis-chart-card:hover{transform:translateY(-4px);box-shadow:0 14px 28px rgba(75,79,145,.12)}
+    .oshi:hover{transform:translateX(4px) scale(1.015)}
+    .stat:hover{transform:translateY(-3px);box-shadow:0 12px 25px rgba(75,79,145,.10)}
+  }
+}
 </style>
 </head>
 <body>
@@ -480,6 +519,79 @@ function setTab(name){tab=name;$$('.tab').forEach(x=>x.classList.toggle('active'
 function closeModals(){$$('.modal-bg').forEach(m=>m.classList.remove('open'))}
 $$('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));$$('.navbtn[data-view]').forEach(b=>b.onclick=()=>setView(b.dataset.view));$$('.analysis-period-btn').forEach(b=>b.onclick=async()=>{let next=b.dataset.analysisPeriod||'monthly';if(next===analysisPeriod&&analysisLoaded&&analysisLoadedPeriod===analysisPeriod){renderAnalysis();return}analysisPeriod=next;analysisStreams=[];analysisLoaded=false;analysisLoadedPeriod='';renderAnalysis();await loadAnalysis(true)});$('#discoverShuffle').onclick=loadDiscover;$('#refreshBtn').onclick=fetchLive;$('#notifyEmailNavBtn').onclick=openNotifyEmailModal;$('#notifyEmailSaveBtn').onclick=saveNotifyEmail;$('#notifyEmailDeleteBtn').onclick=deleteNotifyEmail;$('#notifyEmailInput').addEventListener('keydown',e=>{if(e.key==='Enter')saveNotifyEmail()});$('#oshiAddNavBtn').onclick=()=>{selectedChannel=null;$('#vtuberSearchInput').value='';$('#channelInput').value='';$('#selectedNote').classList.remove('show');$('#searchResults').innerHTML='<div class="search-empty">名前を入力して検索してね。<br>候補から推しを選べるよ。</div>';$('#addModal').classList.add('open')};$('#searchVtuberBtn').onclick=searchVtubers;$('#vtuberSearchInput').addEventListener('keydown',e=>{if(e.key==='Enter')searchVtubers()});$$('[data-close]').forEach(b=>b.onclick=closeModals);$$('.modal-bg').forEach(m=>m.onclick=e=>{if(e.target===m)closeModals()});$('#saveOshiBtn').onclick=addOshi;setInterval(()=>{if(appView==='home')renderHero()},1000);
 (function(){localStorage.removeItem(LS.focus);activeOshiId='';if(demoMode()){oshi=demoOshi;streams=makeDemo();historyLoaded=true;if(!laterIds.size){['demo-4','demo-9','demo-11','demo-13'].forEach(id=>laterIds.add(id));localStorage.setItem(LS.later,JSON.stringify([...laterIds]))}}else{streams=[]}let notifyParam=new URLSearchParams(location.search).get('notify');if(notifyParam==='confirmed'){notifyVerified=true;localStorage.setItem(LS.notifyVerified,'1');history.replaceState(null,'',location.pathname+location.hash);setTimeout(()=>toast('メール通知を有効にしたよ'),50)}else if(notifyParam==='invalid'){history.replaceState(null,'',location.pathname+location.hash);setTimeout(()=>toast('確認リンクが無効か期限切れだよ'),50)}render();renderNotifyEmailState();if(!demoMode())refreshNotifyCapacity(true);if(!demoMode()&&oshi.length)fetchLive();if(!demoMode()&&notifyToken&&notifyEmail)syncNotificationSubscription(true)})();
+</script>
+
+<script>
+/* Vdule motion UI v2 controller — presentation only. */
+(function(){
+  'use strict';
+  if(window.__vduleMotionV2)return;
+  window.__vduleMotionV2=true;
+  var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if(reduce)return;
+
+  function restartClass(el,name,delay){
+    if(!el)return;
+    el.classList.remove(name);
+    void el.offsetWidth;
+    el.classList.add(name);
+    if(delay)setTimeout(function(){el.classList.remove(name)},delay);
+  }
+  function easeOutCubic(t){return 1-Math.pow(1-t,3)}
+  function animateText(el,formatter,target,duration){
+    if(!el||!Number.isFinite(target)||target<0)return;
+    var start=performance.now();
+    el.classList.add('vdule-counting');
+    function frame(now){
+      var p=Math.min(1,(now-start)/duration),v=Math.round(target*easeOutCubic(p));
+      el.textContent=formatter(v);
+      if(p<1)requestAnimationFrame(frame);else setTimeout(function(){el.classList.remove('vdule-counting')},140);
+    }
+    requestAnimationFrame(frame);
+  }
+  function animateMetricValue(el){
+    if(!el)return;
+    var text=(el.textContent||'').trim(),m;
+    if((m=text.match(/^(\d+)(配信|本|日)$/))){
+      var n=Number(m[1]),suffix=m[2];animateText(el,function(v){return v+suffix},n,620);return;
+    }
+    if((m=text.match(/^(\d+)時間(\d+)分$/))){
+      var mins=Number(m[1])*60+Number(m[2]);
+      animateText(el,function(v){return Math.floor(v/60)+'時間'+(v%60)+'分'},mins,760);return;
+    }
+    if((m=text.match(/^(\d{1,2}):(\d{2})$/))){
+      var total=Number(m[1])*60+Number(m[2]);
+      animateText(el,function(v){var h=Math.floor(v/60)%24,mm=v%60;return String(h).padStart(2,'0')+':'+String(mm).padStart(2,'0')},total,700);return;
+    }
+    restartClass(el,'vdule-counting',380);
+  }
+  function animateAnalysisMetrics(){
+    document.querySelectorAll('#analysisMetrics .analysis-card-value').forEach(animateMetricValue);
+  }
+  function animatePie(pie){
+    if(!pie)return;
+    restartClass(pie,'vdule-pie-reveal',850);
+    var b=pie.querySelector('.analysis-pie-center b');
+    if(b&&/^\d+$/.test((b.textContent||'').trim()))animateText(b,function(v){return String(v)},Number(b.textContent),650);
+  }
+
+  var metrics=document.getElementById('analysisMetrics');
+  if(metrics){
+    new MutationObserver(function(){requestAnimationFrame(animateAnalysisMetrics)}).observe(metrics,{childList:true});
+    requestAnimationFrame(animateAnalysisMetrics);
+  }
+  ['analysisTimePie','analysisWeekPie','analysisMediaPie'].forEach(function(id){
+    var pie=document.getElementById(id);if(!pie)return;
+    new MutationObserver(function(){requestAnimationFrame(function(){animatePie(pie)})}).observe(pie,{childList:true,attributes:true,attributeFilter:['style']});
+  });
+
+  document.addEventListener('click',function(e){
+    var btn=e.target.closest('button,.navbtn,.tab,.analysis-period-btn,.act,.refresh,.oshi');
+    if(btn)restartClass(btn,'vdule-click-pop',390);
+    var refresh=e.target.closest('#refreshBtn');
+    if(refresh)restartClass(refresh,'vdule-refresh-tap',600);
+  },true);
+})();
 </script>
 </body>
 </html>

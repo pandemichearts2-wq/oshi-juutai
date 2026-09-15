@@ -79,6 +79,51 @@ linear-gradient(180deg,#343a67 0%,#30375f 55%,#394573 100%);box-shadow:0 18px 50
   padding-top:12px;
   padding-bottom:2px;
 }
+
+/* Vdule motion UI — visual effects only; application logic is unchanged */
+@media (prefers-reduced-motion:no-preference){
+  @keyframes vdulePageIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  @keyframes vduleCardIn{from{opacity:0;transform:translateY(10px) scale(.992)}to{opacity:1;transform:none}}
+  @keyframes vduleSoftPop{0%{opacity:0;transform:scale(.97) translateY(5px)}100%{opacity:1;transform:none}}
+  @keyframes vduleTabPop{0%{transform:scale(.94)}60%{transform:scale(1.035)}100%{transform:scale(1)}}
+  @keyframes vduleLivePulse{0%,100%{box-shadow:0 0 0 4px rgba(255,85,119,.10)}50%{box-shadow:0 0 0 8px rgba(255,85,119,.02)}}
+  @keyframes vdulePieIn{from{opacity:.28;transform:rotate(-12deg) scale(.88)}to{opacity:1;transform:none}}
+  @keyframes vduleLegendIn{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+
+  .page-view.active{animation:vdulePageIn .28s cubic-bezier(.2,.75,.25,1) both}
+  .modal-bg.open .modal{animation:vduleSoftPop .22s cubic-bezier(.2,.8,.25,1) both}
+  .navbtn.active,.tab.active,.analysis-period-btn.active{animation:vduleTabPop .22s ease-out both}
+  .status-dot.live{animation:vduleLivePulse 1.9s ease-in-out infinite}
+
+  .stats .stat{animation:vduleCardIn .34s cubic-bezier(.2,.75,.25,1) both}
+  .stats .stat:nth-child(2){animation-delay:.045s}.stats .stat:nth-child(3){animation-delay:.09s}.stats .stat:nth-child(4){animation-delay:.135s}
+
+  .stream-list .stream{animation:vduleCardIn .32s cubic-bezier(.2,.75,.25,1) both}
+  .stream-list .stream:nth-child(2){animation-delay:.025s}.stream-list .stream:nth-child(3){animation-delay:.05s}.stream-list .stream:nth-child(4){animation-delay:.075s}.stream-list .stream:nth-child(5){animation-delay:.10s}.stream-list .stream:nth-child(6){animation-delay:.125s}
+
+  .analysis-card{animation:vduleCardIn .32s cubic-bezier(.2,.75,.25,1) both}
+  .analysis-card:nth-child(2){animation-delay:.03s}.analysis-card:nth-child(3){animation-delay:.06s}.analysis-card:nth-child(4){animation-delay:.09s}.analysis-card:nth-child(5){animation-delay:.12s}.analysis-card:nth-child(6){animation-delay:.15s}.analysis-card:nth-child(7){animation-delay:.18s}.analysis-card:nth-child(8){animation-delay:.21s}.analysis-card:nth-child(9){animation-delay:.24s}
+  .analysis-chart-card{animation:vduleCardIn .34s cubic-bezier(.2,.75,.25,1) both}
+  .analysis-chart-card:nth-child(2){animation-delay:.055s}.analysis-chart-card:nth-child(3){animation-delay:.11s}
+  .analysis-pie{animation:vdulePieIn .48s cubic-bezier(.2,.75,.25,1) both}
+  .analysis-legend-row{animation:vduleLegendIn .28s ease-out both}
+  .analysis-legend-row:nth-child(2){animation-delay:.035s}.analysis-legend-row:nth-child(3){animation-delay:.07s}.analysis-legend-row:nth-child(4){animation-delay:.105s}.analysis-legend-row:nth-child(5){animation-delay:.14s}
+
+  .navbtn,.tab,.analysis-period-btn,.btn,.act,.refresh,.miniadd,.more,.nav-add-oshi,.nav-add-email,.discover-shuffle,.discover-btn,.discover-add-oshi,.pick-btn,.search-result,.oshi,.stat,.stream,.analysis-card,.analysis-chart-card,.thumb img{transition:transform .17s ease,box-shadow .17s ease,border-color .17s ease,background-color .17s ease,opacity .17s ease}
+  button:active,.navbtn:active,.tab:active,.act:active,.refresh:active,.miniadd:active,.more:active,.nav-add-oshi:active,.nav-add-email:active,.analysis-period-btn:active,.discover-shuffle:active,.discover-btn:active,.discover-add-oshi:active,.pick-btn:active{transform:translateY(1px) scale(.975)}
+
+  @media (hover:hover) and (pointer:fine){
+    .stream:hover{transform:translateY(-2px);box-shadow:0 9px 22px rgba(75,79,145,.10);border-color:#d6d9f0}
+    .stream:hover .thumb img{transform:scale(1.025)}
+    .analysis-card:hover,.analysis-chart-card:hover{transform:translateY(-2px);box-shadow:0 9px 21px rgba(75,79,145,.09)}
+    .oshi:hover{transform:translateX(2px)}
+  }
+}
+@media (prefers-reduced-motion:reduce){
+  .status-dot.live,.loading-dot{animation-duration:.001ms!important;animation-iteration-count:1!important}
+  *,*::before,*::after{scroll-behavior:auto!important}
+}
+
 </style>
 </head>
 <body>

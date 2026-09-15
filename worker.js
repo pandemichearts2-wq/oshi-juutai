@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v17-email-notify-capacity';
+const VERSION = 'youtube-search-v18-gas-email-notify-capacity';
 const MAX_NOTIFY_SUBSCRIBERS = 20;
 const NOTIFY_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -1325,7 +1325,7 @@ async function upsertNotifySubscription(request, env) {
   await env.NOTIFY_DB.batch(statements);
   await seedExistingUpcomingForToken(env, token, addedChannelIds);
   let confirmationSent = false;
-  if (!verified && (emailChanged || !existing)) {
+  if (!verified) {
     await sendVerificationEmail(env, email, token, verifyKey, new URL(request.url).origin);
     confirmationSent = true;
   }
@@ -1369,29 +1369,44 @@ function chunksOf(items, size) {
   return out;
 }
 
-async function sendVerificationEmail(env, to, token, verifyKey, origin) {
-  if (!env.RESEND_API_KEY || !env.NOTIFY_FROM_EMAIL) {
-    throw new Error('メール送信用のRESEND_API_KEY / NOTIFY_FROM_EMAILが未設定です。');
+async function sendGasMail(env, to, subject, body) {
+  if (!env.GAS_NOTIFY_URL || !env.GAS_NOTIFY_SECRET) {
+    throw new Error('メール送信用のGAS_NOTIFY_URL / GAS_NOTIFY_SECRETが未設定です。');
   }
-  const confirmUrl = `${origin}/api/notify/confirm?token=${encodeURIComponent(token)}&key=${encodeURIComponent(verifyKey)}`;
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await fetch(String(env.GAS_NOTIFY_URL), {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Content-Type': 'application/json' },
+    redirect: 'follow',
     body: JSON.stringify({
-      from: env.NOTIFY_FROM_EMAIL,
-      to: [to],
-      subject: '【Vdule】配信予定メール通知の確認',
-      text: `Vduleの配信予定メール通知を有効にします。\n\n以下のリンクを開いて登録を完了してください。\n${confirmUrl}`
+      secret: String(env.GAS_NOTIFY_SECRET),
+      to: String(to || ''),
+      subject: String(subject || ''),
+      body: String(body || '')
     })
   });
+  let detail = '';
+  try { detail = await res.text(); } catch {}
   if (!res.ok) {
-    let detail = '';
-    try { detail = await res.text(); } catch {}
-    throw new Error(`確認メールを送信できませんでした (Resend ${res.status}): ${detail.slice(0, 200)}`);
+    throw new Error(`Apps Scriptメール送信に失敗しました (${res.status}): ${detail.slice(0, 300)}`);
   }
+  if (detail) {
+    try {
+      const payload = JSON.parse(detail);
+      if (!payload?.ok) throw new Error(payload?.error || 'Apps Script側でメール送信に失敗しました。');
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        throw new Error(`Apps Scriptから不正な応答が返りました: ${detail.slice(0, 300)}`);
+      }
+      throw err;
+    }
+  }
+}
+
+async function sendVerificationEmail(env, to, token, verifyKey, origin) {
+  const confirmUrl = `${origin}/api/notify/confirm?token=${encodeURIComponent(token)}&key=${encodeURIComponent(verifyKey)}`;
+  const subject = '【Vdule】配信予定メール通知の確認';
+  const body = `Vduleの配信予定メール通知を有効にします。\n\n以下のリンクを開いて登録を完了してください。\n${confirmUrl}`;
+  await sendGasMail(env, to, subject, body);
 }
 
 async function confirmNotifySubscription(request, env) {
@@ -1413,36 +1428,17 @@ async function confirmNotifySubscription(request, env) {
 }
 
 async function sendNotifyEmail(env, to, channelName, videoId) {
-  if (!env.RESEND_API_KEY || !env.NOTIFY_FROM_EMAIL) {
-    throw new Error('メール送信用のRESEND_API_KEY / NOTIFY_FROM_EMAILが未設定です。');
-  }
   const link = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
-  const text = `---------------------------------------------\n${channelName}\nの配信予定が入りました📢\n\n↓↓通知をＯＮにしに行く↓↓\n${link}\n---------------------------------------------`;
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      from: env.NOTIFY_FROM_EMAIL,
-      to: [to],
-      subject: `【Vdule】${channelName}の配信予定が入りました`,
-      text
-    })
-  });
-  if (!res.ok) {
-    let detail = '';
-    try { detail = await res.text(); } catch {}
-    throw new Error(`Resend ${res.status}: ${detail.slice(0, 300)}`);
-  }
+  const body = `---------------------------------------------\n${channelName}\nの配信予定が入りました📢\n\n↓↓通知をＯＮにしに行く↓↓\n${link}\n---------------------------------------------`;
+  const subject = `【Vdule】${channelName}の配信予定が入りました`;
+  await sendGasMail(env, to, subject, body);
 }
 
 async function runNotificationCron(env) {
   if (!env.NOTIFY_DB || !env.HOLODEX_API_KEY) return;
   await ensureNotifySchema(env);
-  if (!env.RESEND_API_KEY || !env.NOTIFY_FROM_EMAIL) {
-    console.warn('notification cron skipped: mail provider not configured');
+  if (!env.GAS_NOTIFY_URL || !env.GAS_NOTIFY_SECRET) {
+    console.warn('notification cron skipped: GAS mail provider not configured');
     return;
   }
 

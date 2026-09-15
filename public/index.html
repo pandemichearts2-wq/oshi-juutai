@@ -326,7 +326,7 @@ linear-gradient(180deg,#343a67 0%,#30375f 55%,#394573 100%);box-shadow:0 18px 50
 </main>
 </div>
 <div class="modal-bg" id="notifyEmailModal"><div class="modal"><h3>配信予定メール通知</h3><p>登録中の推しに新しい配信予定が入ったら、このアドレスへお知らせします。</p><div class="field"><label>通知先メールアドレス</label><input id="notifyEmailInput" type="email" autocomplete="email" placeholder="example@example.com"></div><div class="notify-status" id="notifyEmailStatus">メールアドレスは未登録です。</div><div class="notify-capacity-box" id="notifyCapacityBox">登録枠を確認中...</div><div class="notify-help">空欄にして保存すると、メール通知を停止します。推しを追加・削除した場合は通知対象も自動で同期します。登録上限は20人です。</div><div class="modal-actions"><button class="btn" type="button" data-close>閉じる</button><button class="btn danger" type="button" id="notifyEmailDeleteBtn">通知を停止</button><button class="btn primary" type="button" id="notifyEmailSaveBtn">保存</button></div></div></div>
-<div class="modal-bg" id="contactModal"><div class="modal contact-modal"><h3>問い合わせ</h3><div class="contact-notice">ご返信まで数日かかる可能性があります<br><small>※ 返信先アドレスには、あなたへ返信してほしいメールアドレスを入力してください。</small></div><div class="field"><label>返信先アドレス（あなたのメールアドレス）</label><input id="contactReplyEmail" type="email" autocomplete="email" placeholder="example@example.com" maxlength="254"></div><div class="field"><label>件名</label><input id="contactSubject" type="text" placeholder="お問い合わせ内容の件名" maxlength="120"></div><div class="field"><label>本文（詳細）</label><textarea id="contactBody" rows="8" placeholder="お問い合わせ内容を詳しくご記入ください" maxlength="10000"></textarea></div><input id="contactWebsite" class="contact-honeypot" type="text" tabindex="-1" autocomplete="off" aria-hidden="true"><div class="contact-status" id="contactStatus"></div><div class="modal-actions"><button class="btn" type="button" data-close>閉じる</button><button class="btn primary" type="button" id="contactSendBtn">送信</button></div></div></div>
+<div class="modal-bg" id="contactModal"><div class="modal contact-modal"><h3>問い合わせ</h3><div class="contact-notice">ご返信まで数日かかる可能性があります<br><small>※ 返信先アドレスには、あなたへ返信してほしいメールアドレスを入力してください。</small></div><div class="field"><label>返信先アドレス</label><input id="contactReplyEmail" type="text" inputmode="email" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="example@example.com" maxlength="254"></div><div class="field"><label>件名</label><input id="contactSubject" type="text" placeholder="お問い合わせ内容の件名" maxlength="120"></div><div class="field"><label>本文（詳細）</label><textarea id="contactBody" rows="8" placeholder="お問い合わせ内容を詳しくご記入ください" maxlength="10000"></textarea></div><input id="contactWebsite" class="contact-honeypot" type="text" tabindex="-1" autocomplete="off" aria-hidden="true"><div class="contact-status" id="contactStatus"></div><div class="modal-actions"><button class="btn" type="button" data-close>閉じる</button><button class="btn primary" type="button" id="contactSendBtn">送信</button></div></div></div>
 <div class="modal-bg" id="addModal"><div class="modal"><h3>推しを追加</h3><p>VTuber名で検索して、候補から選ぶだけ。Holodexに登録されているYouTube VTuberを検索します。</p><div class="search-row"><div class="field"><label>VTuber名</label><input id="vtuberSearchInput" autocomplete="off" placeholder="例：兎田ぺこら / Pekora"></div><button class="btn primary search-btn" id="searchVtuberBtn">検索</button></div><div class="search-results" id="searchResults"><div class="search-empty">名前を入力して検索してね。<br>候補から推しを選べるようにしたよ。</div></div><div class="selected-note" id="selectedNote"></div><div class="field"><label>推し度</label><select id="tierInput"><option value="3">最推し</option><option value="2" selected>推し</option><option value="1">気になる</option></select></div><details class="manual-details"><summary>チャンネルIDを直接入力する</summary><div class="field"><label>YouTube チャンネルID</label><input id="channelInput" placeholder="UCxxxxxxxxxxxxxxxxxxxxxx"></div></details><div class="modal-actions"><button class="btn" data-close>閉じる</button><button class="btn primary" id="saveOshiBtn">この推しを追加</button></div></div></div>
 <div class="modal-bg" id="calendarDayModal"><div class="modal calendar-day-modal"><div class="calendar-day-modal-head"><div><div class="calendar-day-modal-kicker">DAILY STREAMS</div><h3 id="calendarDayModalTitle">配信一覧</h3></div><button class="calendar-day-modal-close" type="button" data-close aria-label="閉じる">×</button></div><div class="calendar-day-modal-list" id="calendarDayModalList"></div><div class="modal-actions"><button class="btn" type="button" data-close>閉じる</button></div></div></div>
 <div class="toast" id="toast"></div>
@@ -414,11 +414,11 @@ function openContactModal(){
   const modal=$('#contactModal');
   if(!modal)return;
   const email=$('#contactReplyEmail');
-  if(email&&!email.value&&notifyEmail)email.value=notifyEmail;
+  if(email)email.value='';
   $('#contactStatus').textContent='';
   $('#contactStatus').className='contact-status';
   modal.classList.add('open');
-  setTimeout(()=>email?.focus(),120);
+  setTimeout(()=>{if(email){email.value='';email.focus()}},120);
 }
 async function sendContact(){
   const email=$('#contactReplyEmail').value.trim();
@@ -438,7 +438,7 @@ async function sendContact(){
     let data={};try{data=await res.json()}catch{}
     if(!res.ok||!data?.ok)throw new Error(data?.error||'送信できませんでした。');
     status.textContent='送信しました。';status.classList.add('success');
-    $('#contactSubject').value='';$('#contactBody').value='';$('#contactWebsite').value='';
+    $('#contactReplyEmail').value='';$('#contactSubject').value='';$('#contactBody').value='';$('#contactWebsite').value='';
     toast('問い合わせを送信したよ');
   }catch(e){console.error('contact send failed',e);status.textContent=e?.message||'送信できませんでした。';status.classList.add('error')}
   finally{btn.disabled=false;btn.textContent='送信'}

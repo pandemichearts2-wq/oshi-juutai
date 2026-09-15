@@ -208,6 +208,33 @@ linear-gradient(180deg,#343a67 0%,#30375f 55%,#394573 100%);box-shadow:0 18px 50
   .contact-modal textarea{min-height:150px}
 }
 </style>
+
+<style id="vdule-x-and-analysis-v10">
+/* MY VTUBERS avatar -> X */
+.avatar.avatar-x{position:relative;display:block;border:0;padding:0;cursor:pointer;overflow:visible;background:#dcdcff}
+.avatar.avatar-x img{display:block;width:100%;height:100%;border-radius:50%;object-fit:cover;overflow:hidden}
+.avatar-x-badge{position:absolute;right:-3px;bottom:-3px;display:grid;place-items:center;width:17px;height:17px;border-radius:50%;background:#171923;color:#fff;border:2px solid #3a426f;font:800 9px/1 Arial,sans-serif;box-shadow:0 2px 7px rgba(8,10,30,.35);transition:transform .18s ease,background .18s ease}
+.avatar.avatar-x:hover .avatar-x-badge{transform:scale(1.12);background:#050505}
+.avatar.avatar-x:focus-visible{outline:2px solid #fff;outline-offset:3px}
+
+/* Data analysis: make chart text easier to read without enlarging metric cards */
+.analysis-chart-head b{font-size:14px!important;line-height:1.35}
+.analysis-chart-head span{font-size:10.5px!important;line-height:1.55}
+.analysis-pie-center b{font-size:24px!important}
+.analysis-pie-center span{font-size:10px!important}
+.analysis-legend{gap:9px!important}
+.analysis-legend-row{grid-template-columns:11px minmax(0,1fr) auto!important;gap:8px!important;font-size:11px!important;line-height:1.4}
+.analysis-legend-dot{width:10px!important;height:10px!important}
+.analysis-legend-row b{font-size:11px!important}
+.analysis-legend-row span:last-child{font-size:11px!important}
+@media(max-width:760px){
+  .analysis-chart-head b{font-size:13px!important}
+  .analysis-chart-head span{font-size:10px!important}
+  .analysis-pie-center b{font-size:21px!important}
+  .analysis-pie-center span{font-size:9.5px!important}
+  .analysis-legend-row,.analysis-legend-row b,.analysis-legend-row span:last-child{font-size:10px!important}
+}
+</style>
 </head>
 <body>
 <div class="app">
@@ -470,10 +497,36 @@ function oshiScheduleInfo(id){
  if(at<=weekEnd)return{state:'week',at,label:'1週間以内に配信予定'};
  return{state:'none',at,label:'1週間以内の配信予定なし'};
 }
+function xProfileUrl(value){
+ let s=String(value||'').trim();
+ if(!s)return '';
+ s=s.replace(/^https?:\/\/(?:www\.)?twitter\.com\//i,'').replace(/^https?:\/\/(?:www\.)?x\.com\//i,'');
+ s=s.split(/[?#]/)[0].replace(/^@/,'').replace(/^\/+|\/+$/g,'');
+ if(!/^[A-Za-z0-9_]{1,15}$/.test(s))return '';
+ return 'https://x.com/'+s;
+}
+async function openOshiX(id,event){
+ if(event){event.preventDefault();event.stopPropagation()}
+ let item=oshi.find(o=>o.id===id);
+ if(!item)return;
+ let tab=null;
+ try{tab=window.open('about:blank','_blank');if(tab)tab.opener=null}catch{}
+ let twitter=item.twitter||'';
+ if(!twitter&&!demoMode()){
+  try{
+   const c=await backend({action:'channel',id});
+   twitter=c?.twitter||'';
+   if(twitter){item.twitter=twitter;localStorage.setItem(LS.oshi,JSON.stringify(oshi))}
+  }catch(e){console.warn('X link lookup failed',e)}
+ }
+ const url=xProfileUrl(twitter);
+ if(!url){if(tab)try{tab.close()}catch{};toast('このVTuberのXリンクが見つからなかったよ');return}
+ if(tab){tab.location.href=url}else{window.location.href=url}
+}
 function renderOshi(){
  if(activeOshiId&&!oshi.some(o=>o.id===activeOshiId)){activeOshiId='';localStorage.removeItem(LS.focus)}
  let ordered=oshi.map((o,index)=>({o,index,info:oshiScheduleInfo(o.id)})).sort((a,b)=>{let al=a.info.state==='live'?0:1,bl=b.info.state==='live'?0:1;if(al!==bl)return al-bl;if(a.info.at!==b.info.at)return a.info.at-b.info.at;return a.index-b.index}).map(x=>x.o);
- $('#oshiList').innerHTML=ordered.map(o=>{let info=oshiScheduleInfo(o.id),dotClass=info.state==='live'?'live':info.state==='today'?'today':info.state==='week'?'week':'';return `<div class="oshi ${activeOshiId===o.id?'active':''}" onclick="focusOshi('${esc(o.id)}')" title="クリックでこのVTuberの情報に切り替え"><div class="avatar"><img src="${esc(o.photo||asset('avatar-shiro.jpg'))}" alt=""></div><div class="oshi-name"><b>${esc(o.name||o.english_name||o.id)}</b><span class="tier ${o.tier===1?'curious':''}">${tierLabel(o.tier)}</span></div><div class="side-actions"><i class="status-dot ${dotClass}" title="${esc(info.label)}"></i>${demoMode()?'':`<button class="oshi-remove" title="削除" onclick="event.stopPropagation();removeOshi('${esc(o.id)}')">×</button>`}</div></div>`}).join('');
+ $('#oshiList').innerHTML=ordered.map(o=>{let info=oshiScheduleInfo(o.id),dotClass=info.state==='live'?'live':info.state==='today'?'today':info.state==='week'?'week':'';return `<div class="oshi ${activeOshiId===o.id?'active':''}" onclick="focusOshi('${esc(o.id)}')" title="クリックでこのVTuberの情報に切り替え"><button type="button" class="avatar avatar-x" onclick="openOshiX('${esc(o.id)}',event)" title="Xを開く" aria-label="${esc(o.name||o.english_name||o.id)}のXを開く"><img src="${esc(o.photo||asset('avatar-shiro.jpg'))}" alt=""><span class="avatar-x-badge" aria-hidden="true">X</span></button><div class="oshi-name"><b>${esc(o.name||o.english_name||o.id)}</b><span class="tier ${o.tier===1?'curious':''}">${tierLabel(o.tier)}</span></div><div class="side-actions"><i class="status-dot ${dotClass}" title="${esc(info.label)}"></i>${demoMode()?'':`<button class="oshi-remove" title="削除" onclick="event.stopPropagation();removeOshi('${esc(o.id)}')">×</button>`}</div></div>`}).join('');
 }
 function findJams(){let now=Date.now(),limit=now+50*24*60*60*1000,a=focusedStreams().filter(v=>{if(v.status==='past')return false;let raw=v.start_scheduled||v.start_actual;if(!raw)return false;let t=new Date(raw).getTime();return Number.isFinite(t)&&(v.status==='live'||t<=limit)}).sort((x,y)=>new Date(x.start_scheduled||x.start_actual)-new Date(y.start_scheduled||y.start_actual)),out=[];for(let i=0;i<a.length;i++){let base=new Date(a[i].start_scheduled||a[i].start_actual),g=[a[i]];for(let j=i+1;j<a.length;j++){let d=new Date(a[j].start_scheduled||a[j].start_actual);if(d-base<=60*60*1000)g.push(a[j]);else break}if(g.length>1&&!out.some(z=>z.some(v=>g.includes(v))))out.push(g)}return out}
 function renderStats(){let base=focusedStreams();$('#sLive').textContent=base.filter(v=>v.status==='live').length;$('#sToday').textContent=base.filter(v=>isToday(v.start_scheduled||v.start_actual)).length;$('#sLater').textContent=base.filter(v=>hasLater(v.id)).length;$('#sLiked').textContent=base.filter(v=>hasLike(v.id)).length;$('#laterStat').classList.toggle('active',tab==='later');$('#likeStat').classList.toggle('active',tab==='liked');$('#tabToday').textContent=base.filter(v=>isToday(v.start_scheduled||v.start_actual)).length;$('#tabWeek').textContent=base.filter(v=>in7d(v.start_scheduled||v.start_actual)).length;$('#tabLater').textContent=base.filter(v=>hasLater(v.id)).length;$('#tabLiked').textContent=base.filter(v=>hasLike(v.id)).length;$('#tabAll').textContent=base.length}
@@ -517,7 +570,7 @@ function formatCount(n){n=Number(n)||0;return n.toLocaleString('ja-JP')}
 function renderDiscover(){let box=$('#discoverStage');if(discoverLoading){box.innerHTML='<div class="discover-loading"><span class="loading-dot"></span>まだ知らないVTuberを探しています…</div>';return}if(!discoverItem){box.innerHTML='<div class="discover-empty">「別のVTuberを探す」を押すと、まだ登録していないVTuberをランダムで紹介します。</div>';return}let c=discoverItem.channel||{},v=discoverItem.video||null,registered=oshi.some(o=>o.id===c.id),saved=!!(v?.id&&hasLater(v.id)),chUrl=c.id&&!String(c.id).startsWith('demo-')?'https://www.youtube.com/channel/'+encodeURIComponent(c.id):'#';let videoHtml=v?`<div class="discover-video"><div class="discover-video-label">${v.kind==='stream'?'POPULAR STREAM':'POPULAR VIDEO'}</div><a class="discover-video-thumb" ${v.id&&!String(v.id).startsWith('demo-')?`href="https://www.youtube.com/watch?v=${encodeURIComponent(v.id)}" target="_blank" rel="noopener"`:''}><img src="${esc(v.thumb||'')}" alt=""><span class="discover-video-views">${formatCount(v.view_count)} 回再生</span></a><h3>${esc(v.title||'おすすめ動画')}</h3><div class="discover-video-meta"><span>${v.published_at?fmtPast(v.published_at):''}</span><span>${v.kind==='stream'?'配信アーカイブ':'人気動画'}</span></div></div>`:'<div class="discover-no-video">おすすめ配信を取得できませんでした。<br>チャンネルから直接チェックしてみてね。</div>';box.innerHTML=`<div class="discover-card"><div class="discover-profile"><img src="${esc(c.photo||asset('avatar-shiro.jpg'))}" alt=""><span class="discover-badge">${registered?'登録済み':'未登録'}</span><h3>${esc(c.name||c.id||'VTuber')}</h3><div class="discover-org">${esc(c.org||'VTuber')}</div><div class="discover-subs">チャンネル登録者 ${formatCount(c.subscriber_count)} 人</div><div class="discover-profile-actions"><a class="discover-btn" ${chUrl!=='#'?`href="${chUrl}" target="_blank" rel="noopener"`:''}>チャンネルを見る</a><button class="discover-btn primary ${saved?'saved':''}" ${v?.id?'':'disabled'} onclick="toggleDiscoverLater()">${saved?'後で見る解除':'後で見る'}</button></div><button class="discover-add-oshi" ${registered?'disabled':''} onclick="addDiscoveredOshi()">${registered?'登録済み':'推しに追加する'}</button></div>${videoHtml}</div>`}
 function toggleDiscoverLater(){let c=discoverItem?.channel||{},v=discoverItem?.video;if(!v?.id)return;savedMeta[v.id]={channelId:c.id||'',channelName:c.name||'',title:v.title||'',thumb:v.thumb||thumbnail(v)};localStorage.setItem(LS.savedMeta,JSON.stringify(savedMeta));if(laterIds.has(v.id)){laterIds.delete(v.id);toast('後で見るから外したよ')}else{laterIds.add(v.id);toast('後で見るに追加したよ')}persistSaved();renderDiscover()}
 async function loadDiscover(){if(discoverLoading)return;discoverLoading=true;renderDiscover();try{if(demoMode()){await new Promise(r=>setTimeout(r,350));discoverItem=demoDiscover()}else{let excludes=[...new Set([...oshi.map(o=>o.id),...discoverSeen])].filter(Boolean).slice(-45);discoverItem=await backend({action:'discover',exclude:excludes.join(',')})}if(discoverItem?.channel?.id){discoverSeen.add(discoverItem.channel.id);let arr=[...discoverSeen];if(arr.length>80)arr=arr.slice(-80);discoverSeen=new Set(arr);localStorage.setItem(LS.discoverSeen,JSON.stringify(arr))}}catch(e){console.error('discover failed',e);toast('新しいVTuberを取得できなかったよ');discoverItem=null}finally{discoverLoading=false;renderDiscover()}}
-async function addDiscoveredOshi(){let c=discoverItem?.channel;if(!c?.id||oshi.some(o=>o.id===c.id))return;oshi.push({id:c.id,name:c.name||c.id,english_name:c.english_name||'',photo:c.photo||c.thumbnail||'',org:c.org||'',tier:1});calendarStreams=[];calendarLoaded=false;historyStreams=[];historyLoaded=false;analysisStreams=[];analysisLoaded=false;analysisLoadedPeriod='';localStorage.setItem(LS.oshi,JSON.stringify(oshi));renderOshi();renderDiscover();toast('「気になる」として追加したよ');if(!demoMode()){await fetchLive();await syncNotificationSubscription(true)}}
+async function addDiscoveredOshi(){let c=discoverItem?.channel;if(!c?.id||oshi.some(o=>o.id===c.id))return;oshi.push({id:c.id,name:c.name||c.id,english_name:c.english_name||'',photo:c.photo||c.thumbnail||'',org:c.org||'',twitter:c.twitter||'',tier:1});calendarStreams=[];calendarLoaded=false;historyStreams=[];historyLoaded=false;analysisStreams=[];analysisLoaded=false;analysisLoadedPeriod='';localStorage.setItem(LS.oshi,JSON.stringify(oshi));renderOshi();renderDiscover();toast('「気になる」として追加したよ');if(!demoMode()){await fetchLive();await syncNotificationSubscription(true)}}
 async function loadCalendar(silent=false){if(calendarLoading)return;if(demoMode()){calendarStreams=makeDemo();calendarLoaded=true;renderCalendar();return}if(!oshi.length){calendarStreams=[];calendarLoaded=true;renderCalendar();return}calendarLoading=true;try{let rows=await backend({action:'calendar',ids:oshi.map(o=>o.id).join(',')});calendarStreams=(Array.isArray(rows)?rows:[]).map(mergeTier);calendarLoaded=true;renderCalendar()}catch(e){console.error('calendar fetch failed',e);calendarStreams=[];calendarLoaded=false;if(!silent)toast('カレンダーの配信予定を取得できなかったよ');renderCalendar()}finally{calendarLoading=false}}
 async function setView(name){appView=name;$$('.page-view').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$$('.navbtn[data-view]').forEach(x=>x.classList.toggle('active',x.dataset.view===name));if(name==='home'){renderHero();renderStats();renderJam();renderStreams()}else if(name==='calendar'){renderCalendar();if(!calendarLoaded&&!calendarLoading)loadCalendar(true);if(!historyLoaded&&!historyLoading)loadHistory(true)}else if(name==='ranking'){renderAnalysis();if((!analysisLoaded||analysisLoadedPeriod!==analysisPeriod)&&!analysisLoading)await loadAnalysis(true)}else if(name==='discover'){renderDiscover();if(!discoverItem&&!discoverLoading)loadDiscover()}}
 function render(){let live=!demoMode();$('#mode').classList.toggle('live',live);$('#modeText').textContent=live?'公開β・自動取得':'デモプレビュー';syncSavedMeta();renderOshi();renderHero();renderStats();renderJam();renderStreams();if(appView==='calendar')renderCalendar();if(appView==='ranking')renderAnalysis();if(appView==='discover')renderDiscover()}
@@ -589,7 +642,7 @@ async function addOshi(){
    let c=selectedChannel;
    if(!c){if(!/^UC[A-Za-z0-9_-]{22}$/.test(manual)){toast('検索候補を選ぶか、チャンネルIDを入れてね');return}c=await backend({action:'channel',id:manual})}
    if(c.type&&c.type!=='vtuber'){toast('VTuberチャンネルを選んでね');return}
-   const item={id:c.id,name:c.name||c.english_name||c.id,english_name:c.english_name||'',photo:c.photo||c.thumbnail||'',org:c.org||'',tier};
+   const item={id:c.id,name:c.name||c.english_name||c.id,english_name:c.english_name||'',photo:c.photo||c.thumbnail||'',org:c.org||'',twitter:c.twitter||'',tier};
    let saved=oshi.filter(x=>x.id!==item.id);saved.push(item);oshi=saved;historyStreams=[];historyLoaded=false;calendarStreams=[];calendarLoaded=false;analysisStreams=[];analysisLoaded=false;analysisLoadedPeriod='';localStorage.setItem(LS.oshi,JSON.stringify(oshi));selectedChannel=null;closeModals();render();await fetchLive();await syncNotificationSubscription(true);toast('推しを追加したよ')
  }catch(e){console.error(e);toast('チャンネルを登録できなかったよ')}
 }

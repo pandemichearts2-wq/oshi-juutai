@@ -12,7 +12,7 @@
     {
       "binding": "NOTIFY_DB",
       "database_name": "oshi-juutai-notify",
-      "database_id": "ここをCloudflareで作成したD1のDatabase IDに置き換える"
+      "database_id": "93ed81ad-0f2e-46cf-a23a-b1adbfafaf20"
     }
   ],
   "triggers": {

@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v21-gas-contact-form';
+const VERSION = 'youtube-search-v22-x-youtube-only';
 const MAX_NOTIFY_SUBSCRIBERS = 20;
 const NOTIFY_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -1914,14 +1914,18 @@ async function handleHolodex(request, env, ctx) {
       }
 
       let ytDetail = null;
-      // Holodexにチャンネルが無い / twitterが空欄ならYouTubeで補完する。
-      if ((!c || !c.twitter) && env.YOUTUBE_API_KEY) {
+      // XリンクはHolodexのtwitter値を一切使わない。
+      // チャンネル名・所属などの基本情報は従来どおりHolodexを利用してよいが、
+      // twitterは必ず空にした上でYouTube側だけから取得する。
+      if (c) c = { ...c, twitter: '' };
+
+      if (env.YOUTUBE_API_KEY) {
         try {
           const rows = await youtubeChannelsByIds([id], env.YOUTUBE_API_KEY);
           ytDetail = rows[0] || null;
           if (!c && ytDetail) c = youtubeChannelFromDetail(ytDetail);
         } catch (err) {
-          console.warn('YouTube channel fallback failed', id, err?.status || '', err?.message || err);
+          console.warn('YouTube channel lookup failed', id, err?.status || '', err?.message || err);
         }
       }
 
@@ -1929,7 +1933,9 @@ async function handleHolodex(request, env, ctx) {
         return json({ error: 'VTuberチャンネルを取得できませんでした。' }, 404);
       }
 
-      if (!c.twitter && env.YOUTUBE_API_KEY) {
+      // XリンクだけはYouTube概要欄 / YouTube公開Aboutページからのみ取得する。
+      // YouTube側で見つからなければtwitterは空欄のまま返す。
+      if (env.YOUTUBE_API_KEY) {
         const xHandle = await youtubeXHandleForChannel(id, env.YOUTUBE_API_KEY, ytDetail);
         if (xHandle) c = { ...c, twitter: xHandle };
       }

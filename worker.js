@@ -728,6 +728,62 @@ function youtubeChannelFromDetail(item) {
   };
 }
 
+
+function xHandleFromText(value = '') {
+  const raw = String(value || '')
+    .replace(/\u0026/gi, '&')
+    .replace(/\u003d/gi, '=')
+    .replace(/\u002f/gi, '/')
+    .replace(/\\\//g, '/');
+  const re = /(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com)\/([A-Za-z0-9_]{1,15})(?:[\/?#]|$)/ig;
+  const blocked = new Set(['home','share','intent','search','explore','i','settings','messages','compose']);
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const handle = String(m[1] || '').trim();
+    if (handle && !blocked.has(handle.toLowerCase())) return handle;
+  }
+  return '';
+}
+
+async function youtubeXHandleForChannel(channelId, apiKey, knownDetail = null) {
+  if (!CHANNEL_ID.test(channelId || '') || !apiKey) return '';
+
+  // 1) YouTube Data API のチャンネル概要欄に X / Twitter URL があれば採用。
+  try {
+    let detail = knownDetail;
+    if (!detail) {
+      const rows = await youtubeChannelsByIds([channelId], apiKey);
+      detail = rows[0] || null;
+    }
+    const fromDescription = xHandleFromText(detail?.snippet?.description || '');
+    if (fromDescription) return fromDescription;
+  } catch (err) {
+    console.warn('YouTube X lookup via API failed', channelId, err?.status || '', err?.message || err);
+  }
+
+  // 2) APIでは「チャンネルの外部リンク」自体は返らないため、公開Aboutページも補完確認。
+  //    YouTube側のHTML仕様変更時は失敗しても無視し、既存機能には影響させない。
+  try {
+    const res = await fetch(`https://www.youtube.com/channel/${encodeURIComponent(channelId)}/about`, {
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'ja,en;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (compatible; Vdule/1.0)'
+      },
+      redirect: 'follow'
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const fromPage = xHandleFromText(html);
+      if (fromPage) return fromPage;
+    }
+  } catch (err) {
+    console.warn('YouTube X lookup via channel page failed', channelId, err?.message || err);
+  }
+
+  return '';
+}
+
 function scoreYoutubeCandidate(c, q, meta = {}) {
   const needle = normalize(q);
   const name = normalize(c?.name || '');
@@ -1826,8 +1882,8 @@ async function handleHolodex(request, env, ctx) {
     });
   }
 
-  // LIVE・チャンネルID直接登録はこれまで通りHolodex。
-  if (!env.HOLODEX_API_KEY) {
+  // LIVE等はHolodex必須。チャンネル詳細だけはXリンク補完のためYouTube単独でも取得可。
+  if (!env.HOLODEX_API_KEY && action !== 'channel') {
     return json({
       error: 'サーバーのHolodex APIキーが未設定です。',
       workerVersion: VERSION
@@ -1852,9 +1908,30 @@ async function handleHolodex(request, env, ctx) {
         return json({ error: 'YouTubeチャンネルIDの形式が正しくありません。' }, 400);
       }
 
-      const c = await getChannel(id, env.HOLODEX_API_KEY);
+      let c = null;
+      if (env.HOLODEX_API_KEY) {
+        c = await getChannel(id, env.HOLODEX_API_KEY);
+      }
+
+      let ytDetail = null;
+      // Holodexにチャンネルが無い / twitterが空欄ならYouTubeで補完する。
+      if ((!c || !c.twitter) && env.YOUTUBE_API_KEY) {
+        try {
+          const rows = await youtubeChannelsByIds([id], env.YOUTUBE_API_KEY);
+          ytDetail = rows[0] || null;
+          if (!c && ytDetail) c = youtubeChannelFromDetail(ytDetail);
+        } catch (err) {
+          console.warn('YouTube channel fallback failed', id, err?.status || '', err?.message || err);
+        }
+      }
+
       if (!c) {
         return json({ error: 'VTuberチャンネルを取得できませんでした。' }, 404);
+      }
+
+      if (!c.twitter && env.YOUTUBE_API_KEY) {
+        const xHandle = await youtubeXHandleForChannel(id, env.YOUTUBE_API_KEY, ytDetail);
+        if (xHandle) c = { ...c, twitter: xHandle };
       }
 
       payload = c;

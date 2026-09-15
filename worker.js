@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v18-gas-email-notify-capacity';
+const VERSION = 'youtube-search-v19-gas-analysis-full-range';
 const MAX_NOTIFY_SUBSCRIBERS = 20;
 const NOTIFY_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -396,7 +396,7 @@ async function youtubeHistory(ids, apiKey) {
 }
 
 
-async function holodexAnalysisForChannel(channelId, apiKey, fromIso, toIso, maxPages = 4) {
+async function holodexAnalysisForChannel(channelId, apiKey, fromIso, toIso, maxPages = 40) {
   const out = new Map();
   const pageSize = 50;
 
@@ -461,10 +461,16 @@ async function analysisHistory(ids, holodexKey, youtubeKey, fromIso, toIso) {
   const requested = [...new Set(ids)].filter(id => CHANNEL_ID.test(id)).slice(0, 20);
   const fromMs = new Date(fromIso).getTime();
   const toMs = new Date(toIso).getTime();
+  if (!requested.length) return [];
 
-  // Cloudflare Workerの外部サブリクエスト数を抑えるため、登録人数に応じてページ上限を自動調整。
-  const holodexPageBudget = Math.max(1, Math.min(12, Math.floor(30 / Math.max(1, requested.length))));
-  const hdGroups = await mapLimited(requested, 4, async id => {
+  // データ分析は「件数固定」ではなく、指定期間を取り切るまでページングする。
+  // UIからは1チャンネルずつ呼ぶため、年間でも50件×最大40ページ（最大2000件/人）まで取得できる。
+  // 複数IDを直接渡された場合だけ、Workerの外部リクエスト過多を避けるため安全側の上限に落とす。
+  const holodexPageBudget = requested.length === 1
+    ? 40
+    : Math.max(2, Math.min(10, Math.floor(40 / requested.length)));
+
+  const hdGroups = await mapLimited(requested, Math.min(4, requested.length), async id => {
     try {
       return await holodexAnalysisForChannel(id, holodexKey, fromIso, toIso, holodexPageBudget);
     } catch (err) {
@@ -480,12 +486,15 @@ async function analysisHistory(ids, holodexKey, youtubeKey, fromIso, toIso) {
     else fallbackIds.push(requested[i]);
   });
 
-  // Holodex側で履歴が取れないチャンネルだけYouTube uploadsから補完。
+  // Holodex側で履歴が0件だったチャンネルだけYouTube uploadsから補完。
+  // こちらも1チャンネル呼び出し時は期間の開始位置まで最大40ページ追う。
   if (fallbackIds.length && youtubeKey) {
     try {
-      const youtubePageBudget = Math.max(1, Math.min(6, Math.floor(12 / Math.max(1, fallbackIds.length))));
+      const youtubePageBudget = fallbackIds.length === 1
+        ? 40
+        : Math.max(2, Math.min(10, Math.floor(40 / fallbackIds.length)));
       const seeds = await youtubeHistoryChannelSeeds(fallbackIds, youtubeKey);
-      const ytGroups = await mapLimited(seeds, 3, c => youtubeHistoryForChannelRange(c, youtubeKey, fromMs, toMs, youtubePageBudget));
+      const ytGroups = await mapLimited(seeds, Math.min(3, seeds.length || 1), c => youtubeHistoryForChannelRange(c, youtubeKey, fromMs, toMs, youtubePageBudget));
       ytGroups.flat().forEach(v => v?.id && out.set(v.id, v));
     } catch (err) {
       console.warn('YouTube analysis fallback failed', err?.status || '', err?.message || err);

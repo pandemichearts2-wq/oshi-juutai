@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v14-live-fallback';
+const VERSION = 'youtube-search-v15-data-analysis';
 
 
 function json(data, status = 200, ttl = 0) {
@@ -391,6 +391,106 @@ async function youtubeHistory(ids, apiKey) {
   const channels = await youtubeHistoryChannelSeeds(ids, apiKey);
   const groups = await mapLimited(channels, 3, c => youtubeHistoryForChannel(c, apiKey));
   return groups.flat();
+}
+
+
+async function holodexAnalysisForChannel(channelId, apiKey, fromIso, toIso, maxPages = 4) {
+  const out = new Map();
+  const pageSize = 50;
+
+  for (let page = 0; page < maxPages; page++) {
+    const params = new URLSearchParams({
+      channel_id: channelId,
+      status: 'past',
+      type: 'stream',
+      sort: 'available_at',
+      order: 'desc',
+      limit: String(pageSize),
+      offset: String(page * pageSize),
+      from: fromIso,
+      to: toIso,
+      include: 'live_info'
+    });
+
+    const rows = await holodex('/videos?' + params.toString(), apiKey);
+    const arr = Array.isArray(rows) ? rows : [];
+    for (const v of arr) {
+      if (!v?.id) continue;
+      out.set(v.id, {
+        ...v,
+        channel_id: v?.channel?.id || v?.channel_id || channelId,
+        channel: v?.channel || { id: channelId, name: channelId, photo: '', type: 'vtuber' }
+      });
+    }
+    if (arr.length < pageSize) break;
+  }
+
+  return [...out.values()];
+}
+
+async function youtubeHistoryForChannelRange(channel, apiKey, fromMs, toMs, maxPages = 3) {
+  const out = new Map();
+  let pageToken = '';
+
+  for (let page = 0; page < maxPages; page++) {
+    const list = await youtubePlaylistItems(channel.uploads, apiKey, pageToken);
+    const details = await youtubeVideoDetails(list.ids, apiKey);
+    let oldest = Infinity;
+
+    for (const item of details) {
+      const raw = item?.liveStreamingDetails?.actualStartTime || item?.snippet?.publishedAt || '';
+      const t = new Date(raw).getTime();
+      if (Number.isFinite(t)) oldest = Math.min(oldest, t);
+
+      const row = historyVideoRow(item, channel);
+      if (!row) continue;
+      const start = new Date(row.start_actual || row.published_at || 0).getTime();
+      if (Number.isFinite(start) && start >= fromMs && start <= toMs) out.set(row.id, row);
+    }
+
+    pageToken = list.nextPageToken;
+    if (!pageToken || (Number.isFinite(oldest) && oldest < fromMs)) break;
+  }
+
+  return [...out.values()];
+}
+
+async function analysisHistory(ids, holodexKey, youtubeKey, fromIso, toIso) {
+  const requested = [...new Set(ids)].filter(id => CHANNEL_ID.test(id)).slice(0, 20);
+  const fromMs = new Date(fromIso).getTime();
+  const toMs = new Date(toIso).getTime();
+
+  // Cloudflare Workerの外部サブリクエスト数を抑えるため、登録人数に応じてページ上限を自動調整。
+  const holodexPageBudget = Math.max(1, Math.min(12, Math.floor(30 / Math.max(1, requested.length))));
+  const hdGroups = await mapLimited(requested, 4, async id => {
+    try {
+      return await holodexAnalysisForChannel(id, holodexKey, fromIso, toIso, holodexPageBudget);
+    } catch (err) {
+      console.warn('Holodex analysis history failed', id, err?.status || '', err?.message || err);
+      return [];
+    }
+  });
+
+  const out = new Map();
+  const fallbackIds = [];
+  hdGroups.forEach((rows, i) => {
+    if (rows.length) rows.forEach(v => v?.id && out.set(v.id, v));
+    else fallbackIds.push(requested[i]);
+  });
+
+  // Holodex側で履歴が取れないチャンネルだけYouTube uploadsから補完。
+  if (fallbackIds.length && youtubeKey) {
+    try {
+      const youtubePageBudget = Math.max(1, Math.min(6, Math.floor(12 / Math.max(1, fallbackIds.length))));
+      const seeds = await youtubeHistoryChannelSeeds(fallbackIds, youtubeKey);
+      const ytGroups = await mapLimited(seeds, 3, c => youtubeHistoryForChannelRange(c, youtubeKey, fromMs, toMs, youtubePageBudget));
+      ytGroups.flat().forEach(v => v?.id && out.set(v.id, v));
+    } catch (err) {
+      console.warn('YouTube analysis fallback failed', err?.status || '', err?.message || err);
+    }
+  }
+
+  return [...out.values()].sort((a, b) => new Date(a.start_actual || a.published_at || 0) - new Date(b.start_actual || b.published_at || 0));
 }
 
 function videoThumb(item) {
@@ -1105,6 +1205,61 @@ async function handleHolodex(request, env, ctx) {
     }
   }
 
+
+
+  if (action === 'analysis') {
+    const ids = [...new Set(
+      (url.searchParams.get('ids') || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(id => CHANNEL_ID.test(id))
+    )].slice(0, 20);
+
+    if (!ids.length) return json([], 200, 900);
+    if (!env.HOLODEX_API_KEY) {
+      return json({
+        error: 'サーバーのHolodex APIキーが未設定です。',
+        workerVersion: VERSION
+      }, 503);
+    }
+
+    const now = new Date();
+    const defaultFrom = new Date(now.getFullYear(), 0, 1);
+    const rawFrom = url.searchParams.get('from') || defaultFrom.toISOString();
+    const rawTo = url.searchParams.get('to') || now.toISOString();
+    const fromDate = new Date(rawFrom);
+    const toDate = new Date(rawTo);
+
+    if (!Number.isFinite(fromDate.getTime()) || !Number.isFinite(toDate.getTime()) || fromDate > toDate) {
+      return json({ error: '分析期間が正しくありません。' }, 400);
+    }
+    if (toDate.getTime() - fromDate.getTime() > 370 * 24 * 60 * 60 * 1000) {
+      return json({ error: '分析期間は最大370日です。' }, 400);
+    }
+
+    const fromIso = fromDate.toISOString();
+    const toIso = toDate.toISOString();
+    const cache = caches.default;
+    const cacheUrl = new URL(url.toString());
+    cacheUrl.searchParams.set('_worker', VERSION);
+    cacheUrl.searchParams.set('_source', 'analysis-history');
+    const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
+    const hit = await cache.match(cacheKey);
+    if (hit) return hit;
+
+    try {
+      const payload = await analysisHistory(ids, env.HOLODEX_API_KEY, env.YOUTUBE_API_KEY || '', fromIso, toIso);
+      const response = json(payload, 200, 1800);
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      return response;
+    } catch (err) {
+      console.error('Analysis history failed', err);
+      return json({
+        error: 'データ分析用の配信履歴を取得できませんでした。',
+        workerVersion: VERSION
+      }, 502);
+    }
+  }
 
 
   if (action === 'history') {

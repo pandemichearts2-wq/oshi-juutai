@@ -211,7 +211,11 @@ linear-gradient(180deg,#343a67 0%,#30375f 55%,#394573 100%);box-shadow:0 18px 50
 
 <style id="vdule-youtube-avatar-and-analysis-v11">
 /* MY VTUBERS avatar -> YouTube channel */
-.avatar.avatar-youtube{display:block;cursor:pointer;background:#dcdcff}
+.avatar.avatar-youtube{display:block;cursor:pointer;background:#dcdcff;position:relative;overflow:visible}
+.avatar.avatar-youtube>img{display:block;width:100%;height:100%;object-fit:cover;border-radius:50%}
+.avatar.avatar-youtube::after{content:"";position:absolute;right:-3px;bottom:-2px;width:18px;height:13px;border-radius:4px;background:#ff0033;box-shadow:0 2px 6px rgba(0,0,0,.28),0 0 0 2px rgba(255,255,255,.92);z-index:3;pointer-events:none}
+.avatar.avatar-youtube::before{content:"";position:absolute;right:3px;bottom:1px;width:0;height:0;border-top:3.5px solid transparent;border-bottom:3.5px solid transparent;border-left:6px solid #fff;z-index:4;pointer-events:none}
+.avatar.avatar-youtube:hover::after{transform:scale(1.06)}
 .avatar.avatar-youtube:focus-visible{outline:2px solid #fff;outline-offset:3px}
 
 /* Data analysis: make chart text easier to read without enlarging metric cards */

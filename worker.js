@@ -1,6 +1,6 @@
 const BASE = 'https://holodex.net/api/v2';
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
-const VERSION = 'youtube-search-v19-gas-analysis-full-range';
+const VERSION = 'youtube-search-v20-gas-analysis-media-breakdown';
 const MAX_NOTIFY_SUBSCRIBERS = 20;
 const NOTIFY_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -420,6 +420,7 @@ async function holodexAnalysisForChannel(channelId, apiKey, fromIso, toIso, maxP
       if (!v?.id) continue;
       out.set(v.id, {
         ...v,
+        media_kind: 'stream',
         channel_id: v?.channel?.id || v?.channel_id || channelId,
         channel: v?.channel || { id: channelId, name: channelId, photo: '', type: 'vtuber' }
       });
@@ -430,28 +431,89 @@ async function holodexAnalysisForChannel(channelId, apiKey, fromIso, toIso, maxP
   return [...out.values()];
 }
 
-async function youtubeHistoryForChannelRange(channel, apiKey, fromMs, toMs, maxPages = 3) {
+function isoDurationSeconds(value) {
+  const s = String(value || '');
+  const m = s.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i);
+  if (!m) return 0;
+  return (Number(m[1] || 0) * 86400) + (Number(m[2] || 0) * 3600) + (Number(m[3] || 0) * 60) + Number(m[4] || 0);
+}
+
+function analysisMediaKind(item) {
+  const live = item?.liveStreamingDetails || {};
+  if (live.actualStartTime || live.scheduledStartTime) return 'stream';
+
+  const sn = item?.snippet || {};
+  const seconds = isoDurationSeconds(item?.contentDetails?.duration || '');
+  const publishedMs = new Date(sn.publishedAt || 0).getTime();
+  const text = [sn.title || '', sn.description || '', ...(Array.isArray(sn.tags) ? sn.tags : [])].join(' ').toLowerCase();
+  const explicitShort = /(?:#\s*shorts?\b|\bshorts?\b|ショート)/iu.test(text);
+  const thumbs = sn.thumbnails || {};
+  const thumbList = [thumbs.maxres, thumbs.standard, thumbs.high, thumbs.medium, thumbs.default].filter(Boolean);
+  const verticalHint = thumbList.some(t => Number(t?.height || 0) >= Number(t?.width || 1));
+  const threeMinuteEra = Number.isFinite(publishedMs) && publishedMs >= Date.UTC(2024, 9, 15);
+
+  // YouTube Data APIにはShorts専用フラグや動画アスペクト比がないため推定。
+  // 60秒以下はShorts候補として扱い、1〜3分は#Shorts/ショート表記や縦長サムネイルを補助判定にする。
+  if (seconds > 0 && seconds <= 60) return 'short';
+  if (seconds > 60 && seconds <= 180 && threeMinuteEra && (explicitShort || verticalHint)) return 'short';
+  return 'video';
+}
+
+function analysisMediaRow(item, channel) {
+  const id = item?.id || '';
+  const sn = item?.snippet || {};
+  const live = item?.liveStreamingDetails || {};
+  if (!id) return null;
+
+  const kind = analysisMediaKind(item);
+  if (kind === 'stream' && !live.actualStartTime) return null; // 予定枠は実績分析から除外
+
+  const status = kind === 'stream' ? (live.actualEndTime ? 'past' : 'live') : 'published';
+  return {
+    id,
+    title: sn.title || '(タイトルなし)',
+    desc: sn.description || '',
+    description: sn.description || '',
+    status,
+    type: kind === 'stream' ? 'stream' : 'video',
+    media_kind: kind,
+    duration_seconds: isoDurationSeconds(item?.contentDetails?.duration || ''),
+    start_actual: kind === 'stream' ? (live.actualStartTime || '') : '',
+    end_actual: kind === 'stream' ? (live.actualEndTime || '') : '',
+    published_at: sn.publishedAt || live.actualStartTime || '',
+    channel_id: channel.id,
+    channel: {
+      id: channel.id,
+      name: channel.name || sn.channelTitle || channel.id,
+      photo: channel.photo || '',
+      thumbnail: channel.photo || '',
+      type: 'vtuber'
+    }
+  };
+}
+
+async function youtubeMediaForChannelRange(channel, apiKey, fromMs, toMs, maxPages = 40) {
   const out = new Map();
   let pageToken = '';
 
   for (let page = 0; page < maxPages; page++) {
     const list = await youtubePlaylistItems(channel.uploads, apiKey, pageToken);
     const details = await youtubeVideoDetails(list.ids, apiKey);
-    let oldest = Infinity;
+    let oldestPublished = Infinity;
 
     for (const item of details) {
-      const raw = item?.liveStreamingDetails?.actualStartTime || item?.snippet?.publishedAt || '';
-      const t = new Date(raw).getTime();
-      if (Number.isFinite(t)) oldest = Math.min(oldest, t);
+      const publishedMs = new Date(item?.snippet?.publishedAt || 0).getTime();
+      if (Number.isFinite(publishedMs)) oldestPublished = Math.min(oldestPublished, publishedMs);
 
-      const row = historyVideoRow(item, channel);
+      const row = analysisMediaRow(item, channel);
       if (!row) continue;
-      const start = new Date(row.start_actual || row.published_at || 0).getTime();
-      if (Number.isFinite(start) && start >= fromMs && start <= toMs) out.set(row.id, row);
+      const t = new Date(row.media_kind === 'stream' ? (row.start_actual || row.published_at || 0) : (row.published_at || 0)).getTime();
+      if (Number.isFinite(t) && t >= fromMs && t <= toMs) out.set(row.id, row);
     }
 
     pageToken = list.nextPageToken;
-    if (!pageToken || (Number.isFinite(oldest) && oldest < fromMs)) break;
+    // Uploadsプレイリストは公開日時の新しい順。期間開始より古いページまで来たら終了。
+    if (!pageToken || (Number.isFinite(oldestPublished) && oldestPublished < fromMs)) break;
   }
 
   return [...out.values()];
@@ -463,9 +525,7 @@ async function analysisHistory(ids, holodexKey, youtubeKey, fromIso, toIso) {
   const toMs = new Date(toIso).getTime();
   if (!requested.length) return [];
 
-  // データ分析は「件数固定」ではなく、指定期間を取り切るまでページングする。
-  // UIからは1チャンネルずつ呼ぶため、年間でも50件×最大40ページ（最大2000件/人）まで取得できる。
-  // 複数IDを直接渡された場合だけ、Workerの外部リクエスト過多を避けるため安全側の上限に落とす。
+  // 配信実績はHolodexを優先。1チャンネル呼び出し時は最大40ページまで追う。
   const holodexPageBudget = requested.length === 1
     ? 40
     : Math.max(2, Math.min(10, Math.floor(40 / requested.length)));
@@ -480,28 +540,40 @@ async function analysisHistory(ids, holodexKey, youtubeKey, fromIso, toIso) {
   });
 
   const out = new Map();
-  const fallbackIds = [];
-  hdGroups.forEach((rows, i) => {
-    if (rows.length) rows.forEach(v => v?.id && out.set(v.id, v));
-    else fallbackIds.push(requested[i]);
-  });
+  hdGroups.flat().forEach(v => v?.id && out.set(v.id, v));
 
-  // Holodex側で履歴が0件だったチャンネルだけYouTube uploadsから補完。
-  // こちらも1チャンネル呼び出し時は期間の開始位置まで最大40ページ追う。
-  if (fallbackIds.length && youtubeKey) {
+  // 通常動画・Shorts集計のため、YouTube uploadsはHolodexの成否に関係なく取得する。
+  // 同じ配信IDはマージし、動画/Shortsはmedia_kindを付けた最小限の分析データとして返す。
+  if (youtubeKey) {
     try {
-      const youtubePageBudget = fallbackIds.length === 1
+      const youtubePageBudget = requested.length === 1
         ? 40
-        : Math.max(2, Math.min(10, Math.floor(40 / fallbackIds.length)));
-      const seeds = await youtubeHistoryChannelSeeds(fallbackIds, youtubeKey);
-      const ytGroups = await mapLimited(seeds, Math.min(3, seeds.length || 1), c => youtubeHistoryForChannelRange(c, youtubeKey, fromMs, toMs, youtubePageBudget));
-      ytGroups.flat().forEach(v => v?.id && out.set(v.id, v));
+        : Math.max(2, Math.min(10, Math.floor(40 / requested.length)));
+      const seeds = await youtubeHistoryChannelSeeds(requested, youtubeKey);
+      const ytGroups = await mapLimited(
+        seeds,
+        Math.min(3, seeds.length || 1),
+        c => youtubeMediaForChannelRange(c, youtubeKey, fromMs, toMs, youtubePageBudget)
+      );
+      ytGroups.flat().forEach(v => {
+        if (!v?.id) return;
+        const existing = out.get(v.id);
+        if (existing && v.media_kind === 'stream') {
+          out.set(v.id, { ...existing, ...v, channel: existing.channel || v.channel, media_kind: 'stream' });
+        } else if (!existing) {
+          out.set(v.id, v);
+        }
+      });
     } catch (err) {
-      console.warn('YouTube analysis fallback failed', err?.status || '', err?.message || err);
+      console.warn('YouTube media analysis failed', err?.status || '', err?.message || err);
     }
   }
 
-  return [...out.values()].sort((a, b) => new Date(a.start_actual || a.published_at || 0) - new Date(b.start_actual || b.published_at || 0));
+  return [...out.values()].sort((a, b) => {
+    const ta = new Date(a.media_kind === 'stream' ? (a.start_actual || a.published_at || 0) : (a.published_at || 0)).getTime();
+    const tb = new Date(b.media_kind === 'stream' ? (b.start_actual || b.published_at || 0) : (b.published_at || 0)).getTime();
+    return ta - tb;
+  });
 }
 
 function videoThumb(item) {
